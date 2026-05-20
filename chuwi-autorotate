@@ -1,0 +1,1231 @@
+#!/usr/bin/env python3
+"""User-level X11 auto-rotation helper for the CHUWI MiniBook on Xfce."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+APP_NAME = "chuwi-autorotate"
+SERVICE_NAME = "chuwi-autorotate.service"
+
+CONFIG_DIR = Path.home() / ".config" / APP_NAME
+CONFIG_PATH = CONFIG_DIR / "config.conf"
+STATE_DIR = Path.home() / ".local" / "state" / APP_NAME
+STATE_PATH = STATE_DIR / "state.json"
+SERVICE_DIR = Path.home() / ".config" / "systemd" / "user"
+SERVICE_PATH = SERVICE_DIR / SERVICE_NAME
+GREETER_CONFIG_DIR = Path("/etc/chuwi-autorotate")
+GREETER_CONFIG_PATH = GREETER_CONFIG_DIR / "greeter.conf"
+GREETER_SCRIPT_PATH = Path("/usr/local/bin/chuwi-autorotate-greeter")
+LIGHTDM_CONF_PATH = Path("/etc/lightdm/lightdm.conf.d/80-chuwi-autorotate.conf")
+
+ROTATIONS = ("normal", "right", "inverted", "left")
+ROTATION_DEGREES = {"normal": 0, "right": 90, "inverted": 180, "left": 270}
+DEGREES_ROTATION = {value: key for key, value in ROTATION_DEGREES.items()}
+SENSOR_DEGREES = {"normal": 0, "right-up": 90, "bottom-up": 180, "left-up": 270}
+TOUCH_PATTERNS = ("touch", "touchscreen", "goodix", "silead", "wacom")
+
+DEFAULT_CONFIG = OrderedDict(
+    [
+        ("enabled", "true"),
+        ("display", "auto"),
+        ("home_rotation", "auto"),
+        ("orientation_offset", "right"),
+        ("touch_enabled", "true"),
+        ("debounce_seconds", "1.0"),
+        ("startup_wait_seconds", "90"),
+        ("blacklist_rotations", ""),
+        ("log_file", "~/.local/state/chuwi-autorotate/chuwi-autorotate.log"),
+    ]
+)
+
+TOUCH_MATRICES = {
+    "normal": ("1", "0", "0", "0", "1", "0", "0", "0", "1"),
+    "right": ("0", "1", "0", "-1", "0", "1", "0", "0", "1"),
+    "left": ("0", "-1", "1", "1", "0", "0", "0", "0", "1"),
+    "inverted": ("-1", "0", "1", "0", "-1", "1", "0", "0", "1"),
+}
+
+SERVICE_TEXT = """[Unit]
+Description=CHUWI MiniBook auto-rotation for X11/Xfce
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/chuwi-autorotate run
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+"""
+
+GREETER_SCRIPT_TEXT = """#!/usr/bin/env bash
+set -u
+
+config_file="/etc/chuwi-autorotate/greeter.conf"
+display="auto"
+rotation="normal"
+touch_enabled="true"
+
+if [ -r "$config_file" ]; then
+  # This file is installed root-owned by chuwi-autorotate greeter-install.
+  # shellcheck disable=SC1090
+  . "$config_file"
+fi
+
+case "${rotation:-normal}" in
+  normal|right|inverted|left) ;;
+  *) rotation="normal" ;;
+esac
+
+find_display() {
+  local line name fallback
+  while IFS= read -r line; do
+    case "$line" in
+      *" connected "*)
+        name="${line%% *}"
+        case "$name" in
+          DSI-*|eDP-*|EDP-*|LVDS-*|LCD-*)
+            printf "%s\\n" "$name"
+            return 0
+            ;;
+        esac
+        if [ -z "${fallback:-}" ]; then
+          fallback="$name"
+        fi
+        ;;
+    esac
+  done < <(xrandr --query 2>/dev/null)
+
+  if [ -n "${fallback:-}" ]; then
+    printf "%s\\n" "$fallback"
+  fi
+}
+
+if ! command -v xrandr >/dev/null 2>&1; then
+  exit 0
+fi
+
+if [ "${display:-auto}" = "auto" ]; then
+  display="$(find_display)"
+fi
+
+if [ -z "${display:-}" ]; then
+  exit 0
+fi
+
+xrandr --output "$display" --rotate "$rotation" >/dev/null 2>&1 || exit 0
+
+case "$rotation" in
+  normal) matrix="1 0 0 0 1 0 0 0 1" ;;
+  right) matrix="0 1 0 -1 0 1 0 0 1" ;;
+  left) matrix="0 -1 1 1 0 0 0 0 1" ;;
+  inverted) matrix="-1 0 1 0 -1 1 0 0 1" ;;
+esac
+
+case "${touch_enabled,,}" in
+  1|yes|true|on|enabled) ;;
+  *) exit 0 ;;
+esac
+
+if ! command -v xinput >/dev/null 2>&1; then
+  exit 0
+fi
+
+xinput --list --short 2>/dev/null | while IFS= read -r line; do
+  lower="$(printf "%s" "$line" | tr "[:upper:]" "[:lower:]")"
+  case "$lower" in
+    *touch*|*touchscreen*|*goodix*|*silead*|*wacom*) ;;
+    *) continue ;;
+  esac
+
+  id="${line#*id=}"
+  id="${id%%[[:space:]]*}"
+  case "$id" in
+    ""|*[!0-9]*) continue ;;
+  esac
+
+  # Some Goodix entries are not settable; ignore those and keep the greeter usable.
+  xinput set-prop "$id" "Coordinate Transformation Matrix" $matrix >/dev/null 2>&1 || true
+done
+
+exit 0
+"""
+
+LIGHTDM_CONF_TEXT = f"""[Seat:*]
+display-setup-script={GREETER_SCRIPT_PATH}
+greeter-setup-script={GREETER_SCRIPT_PATH}
+"""
+
+
+@dataclass
+class DisplayInfo:
+    name: str
+    rotation: str
+    primary: bool
+    internal: bool
+    active: bool
+    raw: str
+
+
+class AutorotateError(RuntimeError):
+    pass
+
+
+def expand_path(value: str) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(value)))
+
+
+def ensure_base_dirs() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def default_config_copy() -> OrderedDict:
+    return OrderedDict(DEFAULT_CONFIG)
+
+
+def read_config(create: bool = True) -> OrderedDict:
+    if create:
+        ensure_base_dirs()
+        if not CONFIG_PATH.exists():
+            write_config(default_config_copy())
+
+    config = default_config_copy()
+    extras = OrderedDict()
+
+    if CONFIG_PATH.exists():
+        for raw_line in CONFIG_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key in config:
+                config[key] = value
+            else:
+                extras[key] = value
+
+    for key, value in extras.items():
+        config[key] = value
+    return config
+
+
+def write_config(config: Dict[str, str]) -> None:
+    ensure_base_dirs()
+    output: List[str] = []
+    for key, default_value in DEFAULT_CONFIG.items():
+        output.append(f"{key}={config.get(key, default_value)}")
+
+    extra_keys = [key for key in config.keys() if key not in DEFAULT_CONFIG]
+    for key in extra_keys:
+        output.append(f"{key}={config[key]}")
+
+    CONFIG_PATH.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+def bool_value(value: str) -> bool:
+    return value.strip().lower() in {"1", "yes", "true", "on", "enabled"}
+
+
+def get_float(config: Dict[str, str], key: str, default: float) -> float:
+    try:
+        return float(config.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def log_path(config: Optional[Dict[str, str]] = None) -> Path:
+    if config is None:
+        path_text = DEFAULT_CONFIG["log_file"]
+    else:
+        path_text = config.get("log_file", DEFAULT_CONFIG["log_file"])
+    return expand_path(path_text)
+
+
+def log_event(message: str, config: Optional[Dict[str, str]] = None, also_print: bool = False) -> None:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    line = f"{timestamp} {message}"
+    try:
+        path = log_path(config)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+    if also_print:
+        print(message, flush=True)
+
+
+def load_state() -> Dict[str, str]:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def update_state(**values: str) -> None:
+    ensure_base_dirs()
+    state = load_state()
+    state.update(values)
+    state["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    tmp_path = STATE_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(STATE_PATH)
+
+
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def running_as_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def run_capture(args: List[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+
+
+def run_logged(args: List[str], config: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+    log_event(f"command: {shlex.join(args)}", config)
+    return run_capture(args)
+
+
+def require_command(name: str) -> None:
+    if not command_exists(name):
+        raise AutorotateError(f"{name} is not installed or is not in PATH")
+
+
+def normalize_rotation(rotation: str) -> str:
+    rotation = rotation.strip().lower()
+    if rotation not in ROTATIONS:
+        raise AutorotateError(f"invalid rotation '{rotation}', expected one of: {', '.join(ROTATIONS)}")
+    return rotation
+
+
+def parse_xrandr_rotation(line_tail: str) -> Tuple[str, bool]:
+    tokens = line_tail.split()
+    geometry_index: Optional[int] = None
+
+    for index, token in enumerate(tokens):
+        if re.match(r"^\d+x\d+\+\d+\+\d+$", token):
+            geometry_index = index
+            break
+
+    if geometry_index is None:
+        return "normal", False
+
+    for token in tokens[geometry_index + 1 : geometry_index + 4]:
+        cleaned = token.strip("()")
+        if cleaned in ROTATIONS:
+            return cleaned, True
+
+    return "normal", True
+
+
+def parse_xrandr_displays(output: str) -> List[DisplayInfo]:
+    displays: List[DisplayInfo] = []
+    for line in output.splitlines():
+        match = re.match(r"^(\S+)\s+connected\b(.*)$", line)
+        if not match:
+            continue
+
+        name = match.group(1)
+        tail = match.group(2)
+        rotation, active = parse_xrandr_rotation(tail)
+        lower_name = name.lower()
+        internal = lower_name.startswith(("edp", "lvds", "dsi", "lcd"))
+        primary = " primary " in f" {tail} "
+        displays.append(
+            DisplayInfo(
+                name=name,
+                rotation=rotation,
+                primary=primary,
+                internal=internal,
+                active=active,
+                raw=line,
+            )
+        )
+    return displays
+
+
+def xrandr_displays() -> List[DisplayInfo]:
+    require_command("xrandr")
+    result = run_capture(["xrandr", "--query"])
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise AutorotateError(f"xrandr failed: {detail or 'unknown error'}")
+    return parse_xrandr_displays(result.stdout)
+
+
+def choose_display(displays: List[DisplayInfo], requested: str = "auto") -> DisplayInfo:
+    if requested and requested != "auto":
+        for display in displays:
+            if display.name == requested:
+                return display
+        raise AutorotateError(f"configured display '{requested}' is not connected")
+
+    active = [display for display in displays if display.active]
+    candidates = active or displays
+    if not candidates:
+        raise AutorotateError("no connected display output found with xrandr")
+
+    for display in candidates:
+        if display.primary and display.internal:
+            return display
+    for display in candidates:
+        if display.internal:
+            return display
+    for display in candidates:
+        if display.primary:
+            return display
+    return candidates[0]
+
+
+def detect_display(config: Optional[Dict[str, str]] = None, requested: Optional[str] = None) -> DisplayInfo:
+    displays = xrandr_displays()
+    display_name = requested
+    if display_name is None and config is not None:
+        display_name = config.get("display", "auto")
+    if display_name is None:
+        display_name = "auto"
+    return choose_display(displays, display_name)
+
+
+def parse_blacklist(config: Dict[str, str]) -> set:
+    raw = config.get("blacklist_rotations", "")
+    values = re.split(r"[\s,]+", raw.strip()) if raw.strip() else []
+    return {value for value in values if value in ROTATIONS}
+
+
+def map_sensor_to_rotation(sensor_orientation: str, config: Dict[str, str]) -> str:
+    sensor_orientation = sensor_orientation.strip().lower()
+    if sensor_orientation not in SENSOR_DEGREES:
+        raise AutorotateError(f"unknown sensor orientation '{sensor_orientation}'")
+
+    offset = config.get("orientation_offset", "right").strip().lower()
+    if offset not in ROTATION_DEGREES:
+        raise AutorotateError(
+            f"invalid orientation_offset '{offset}', expected one of: {', '.join(ROTATIONS)}"
+        )
+
+    degrees = (ROTATION_DEGREES[offset] + SENSOR_DEGREES[sensor_orientation]) % 360
+    return DEGREES_ROTATION[degrees]
+
+
+def parse_sensor_orientation(line: str) -> Optional[str]:
+    match = re.search(r"orientation(?:\s+changed)?\s*:\s*([a-z-]+)", line.lower())
+    if not match:
+        return None
+    orientation = match.group(1)
+    if orientation in SENSOR_DEGREES:
+        return orientation
+    return None
+
+
+def detect_touchscreens() -> List[Dict[str, str]]:
+    if not command_exists("xinput"):
+        return []
+
+    result = run_capture(["xinput", "--list", "--short"])
+    if result.returncode != 0:
+        return []
+
+    devices: List[Dict[str, str]] = []
+    seen = set()
+    for line in result.stdout.splitlines():
+        lower = line.lower()
+        if not any(pattern in lower for pattern in TOUCH_PATTERNS):
+            continue
+
+        match = re.search(r"\bid=(\d+)", line)
+        if not match:
+            continue
+
+        device_id = match.group(1)
+        if device_id in seen:
+            continue
+
+        raw_name = line.split("id=", 1)[0]
+        name = re.sub(r"^[^A-Za-z0-9_./-]+", "", raw_name).strip()
+        devices.append({"id": device_id, "name": name or f"id {device_id}"})
+        seen.add(device_id)
+
+    return devices
+
+
+def apply_touch_matrix(rotation: str, config: Dict[str, str]) -> None:
+    if not bool_value(config.get("touch_enabled", "true")):
+        log_event("touch mapping skipped: touch_enabled=false", config)
+        return
+
+    if not command_exists("xinput"):
+        log_event("touch mapping skipped: xinput not installed", config)
+        return
+
+    devices = detect_touchscreens()
+    if not devices:
+        log_event("touch mapping skipped: no touchscreen device detected", config)
+        return
+
+    matrix = TOUCH_MATRICES[rotation]
+    for device in devices:
+        args = [
+            "xinput",
+            "set-prop",
+            device["id"],
+            "Coordinate Transformation Matrix",
+            *matrix,
+        ]
+        result = run_logged(args, config)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            log_event(f"xinput failed for {device['name']} ({device['id']}): {detail}", config)
+
+
+def apply_rotation(rotation: str, config: Dict[str, str], force: bool = False) -> str:
+    rotation = normalize_rotation(rotation)
+    display = detect_display(config)
+    current_rotation = display.rotation
+    args = ["xrandr", "--output", display.name, "--rotate", rotation]
+
+    if not force and current_rotation == rotation:
+        log_event(f"xrandr skipped: {display.name} already {rotation}", config)
+        apply_touch_matrix(rotation, config)
+        update_state(last_applied_rotation=rotation, last_display=display.name)
+        return shlex.join(args)
+
+    result = run_logged(args, config)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise AutorotateError(f"xrandr failed: {detail or 'unknown error'}")
+
+    update_state(last_applied_rotation=rotation, last_display=display.name)
+    apply_touch_matrix(rotation, config)
+    return shlex.join(args)
+
+
+def require_home_rotation(config: Dict[str, str]) -> str:
+    home_rotation = config.get("home_rotation", "auto").strip().lower()
+    if home_rotation == "auto":
+        raise AutorotateError(
+            "HOME rotation is not calibrated yet. Run: chuwi-autorotate calibrate-home"
+        )
+    return normalize_rotation(home_rotation)
+
+
+def reset_to_home(config: Optional[Dict[str, str]] = None, force: bool = True) -> str:
+    if config is None:
+        config = read_config()
+    home_rotation = require_home_rotation(config)
+    return apply_rotation(home_rotation, config, force=force)
+
+
+def systemctl_available() -> bool:
+    return command_exists("systemctl")
+
+
+def systemctl_user(args: List[str]) -> subprocess.CompletedProcess:
+    if not systemctl_available():
+        return subprocess.CompletedProcess(["systemctl", "--user", *args], 127, "", "systemctl not found")
+    return run_capture(["systemctl", "--user", *args])
+
+
+def parse_environment_lines(output: str) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for raw_line in output.splitlines():
+        if "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        if key:
+            values[key] = value
+    return values
+
+
+def user_systemd_environment() -> Dict[str, str]:
+    result = systemctl_user(["show-environment"])
+    if result.returncode != 0:
+        return {}
+    return parse_environment_lines(result.stdout)
+
+
+def adopt_graphical_environment(config: Dict[str, str]) -> bool:
+    if os.environ.get("DISPLAY"):
+        return True
+
+    if not os.environ.get("INVOCATION_ID"):
+        return False
+
+    wait_seconds = max(0.0, get_float(config, "startup_wait_seconds", 90.0))
+    deadline = time.monotonic() + wait_seconds
+    logged_wait = False
+
+    while True:
+        systemd_env = user_systemd_environment()
+        for key in ("DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE"):
+            value = systemd_env.get(key)
+            if value:
+                os.environ[key] = value
+
+        if os.environ.get("DISPLAY"):
+            if not os.environ.get("XAUTHORITY"):
+                default_xauthority = Path.home() / ".Xauthority"
+                if default_xauthority.exists():
+                    os.environ["XAUTHORITY"] = str(default_xauthority)
+
+            log_event(
+                f"adopted graphical environment: DISPLAY={os.environ.get('DISPLAY')}, "
+                f"XAUTHORITY={os.environ.get('XAUTHORITY', 'unset')}, "
+                f"session={os.environ.get('XDG_SESSION_TYPE', 'unknown')}",
+                config,
+                also_print=True,
+            )
+            return True
+
+        if time.monotonic() >= deadline:
+            return False
+
+        if not logged_wait:
+            log_event(
+                f"DISPLAY is not set; waiting up to {wait_seconds:.0f}s for graphical session environment",
+                config,
+                also_print=True,
+            )
+            logged_wait = True
+
+        time.sleep(1)
+
+
+def import_systemd_environment() -> None:
+    if not systemctl_available():
+        return
+    systemctl_user(["import-environment", "DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE"])
+
+
+def ensure_service_file() -> None:
+    SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+    if not SERVICE_PATH.exists() or SERVICE_PATH.read_text(encoding="utf-8") != SERVICE_TEXT:
+        SERVICE_PATH.write_text(SERVICE_TEXT, encoding="utf-8")
+
+
+def root_command(args: List[str]) -> subprocess.CompletedProcess:
+    command = args
+    if not running_as_root():
+        if not command_exists("sudo"):
+            return subprocess.CompletedProcess(args, 127, "", "sudo not found")
+        command = ["sudo", *args]
+    return subprocess.run(command, text=True)
+
+
+def require_success(result: subprocess.CompletedProcess, action: str) -> None:
+    if result.returncode != 0:
+        detail = result.stderr.strip() if result.stderr else ""
+        if not detail and result.stdout:
+            detail = result.stdout.strip()
+        raise AutorotateError(f"{action} failed{': ' + detail if detail else ''}")
+
+
+def greeter_config_text(display: str, rotation: str, touch_enabled: bool) -> str:
+    return "\n".join(
+        [
+            "# Installed by chuwi-autorotate greeter-install.",
+            "# This config is sourced by /usr/local/bin/chuwi-autorotate-greeter.",
+            f"display={shlex.quote(display)}",
+            f"rotation={shlex.quote(rotation)}",
+            f"touch_enabled={shlex.quote('true' if touch_enabled else 'false')}",
+            "",
+        ]
+    )
+
+
+def resolve_greeter_display(config: Dict[str, str], requested: Optional[str]) -> str:
+    display = (requested or config.get("display", "auto")).strip()
+    if display and display != "auto":
+        return display
+
+    try:
+        return detect_display(config, requested="auto").name
+    except AutorotateError:
+        state_display = load_state().get("last_display")
+        if state_display:
+            return state_display
+        raise AutorotateError(
+            "could not detect display for greeter setup; pass --display DSI-1"
+        )
+
+
+def install_greeter_files(display: str, rotation: str, touch_enabled: bool) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"{APP_NAME}-") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        script_path = tmp_path / "chuwi-autorotate-greeter"
+        greeter_config_path = tmp_path / "greeter.conf"
+        lightdm_config_path = tmp_path / "80-chuwi-autorotate.conf"
+
+        script_path.write_text(GREETER_SCRIPT_TEXT, encoding="utf-8")
+        greeter_config_path.write_text(
+            greeter_config_text(display, rotation, touch_enabled), encoding="utf-8"
+        )
+        lightdm_config_path.write_text(LIGHTDM_CONF_TEXT, encoding="utf-8")
+
+        require_success(
+            root_command(
+                [
+                    "install",
+                    "-d",
+                    "-m",
+                    "0755",
+                    str(GREETER_CONFIG_DIR),
+                    str(LIGHTDM_CONF_PATH.parent),
+                    str(GREETER_SCRIPT_PATH.parent),
+                ]
+            ),
+            "creating greeter install directories",
+        )
+        require_success(
+            root_command(["install", "-m", "0755", str(script_path), str(GREETER_SCRIPT_PATH)]),
+            f"installing {GREETER_SCRIPT_PATH}",
+        )
+        require_success(
+            root_command(["install", "-m", "0644", str(greeter_config_path), str(GREETER_CONFIG_PATH)]),
+            f"installing {GREETER_CONFIG_PATH}",
+        )
+        require_success(
+            root_command(["install", "-m", "0644", str(lightdm_config_path), str(LIGHTDM_CONF_PATH)]),
+            f"installing {LIGHTDM_CONF_PATH}",
+        )
+
+
+def greeter_status_summary() -> str:
+    paths = [GREETER_SCRIPT_PATH, GREETER_CONFIG_PATH, LIGHTDM_CONF_PATH]
+    existing = [path for path in paths if path.exists()]
+    if len(existing) == len(paths):
+        return f"installed ({GREETER_CONFIG_PATH})"
+    if existing:
+        return "partially installed"
+    return "not installed"
+
+
+def command_greeter_install(args: argparse.Namespace) -> int:
+    config = read_config(create=not running_as_root())
+    display = resolve_greeter_display(config, args.display)
+    rotation = normalize_rotation(args.rotation or require_home_rotation(config))
+    touch_enabled = bool_value(config.get("touch_enabled", "true")) and not args.no_touch
+
+    if args.dry_run:
+        print(f"Would install {GREETER_SCRIPT_PATH}:")
+        print(GREETER_SCRIPT_TEXT.rstrip())
+        print()
+        print(f"Would install {GREETER_CONFIG_PATH}:")
+        print(greeter_config_text(display, rotation, touch_enabled).rstrip())
+        print()
+        print(f"Would install {LIGHTDM_CONF_PATH}:")
+        print(LIGHTDM_CONF_TEXT.rstrip())
+        return 0
+
+    install_greeter_files(display, rotation, touch_enabled)
+    print(f"Installed LightDM greeter rotation for {display} -> {rotation}.")
+    print(f"LightDM config: {LIGHTDM_CONF_PATH}")
+    print(f"Greeter script: {GREETER_SCRIPT_PATH}")
+    print("It will apply on the next LightDM greeter start, including reboot or lock screen.")
+    return 0
+
+
+def command_greeter_status(_: argparse.Namespace) -> int:
+    print_result("LightDM greeter rotation", greeter_status_summary())
+    print_result("LightDM config", str(LIGHTDM_CONF_PATH))
+    print_result("greeter script", str(GREETER_SCRIPT_PATH))
+    print_result("greeter config", str(GREETER_CONFIG_PATH))
+    if GREETER_CONFIG_PATH.exists():
+        print()
+        print(GREETER_CONFIG_PATH.read_text(encoding="utf-8").rstrip())
+    return 0
+
+
+def command_greeter_uninstall(_: argparse.Namespace) -> int:
+    require_success(
+        root_command(
+            [
+                "rm",
+                "-f",
+                str(LIGHTDM_CONF_PATH),
+                str(GREETER_CONFIG_PATH),
+                str(GREETER_SCRIPT_PATH),
+            ]
+        ),
+        "removing LightDM greeter rotation files",
+    )
+    print("Removed LightDM greeter rotation files.")
+    return 0
+
+
+def user_service_state() -> str:
+    if not systemctl_available():
+        return "systemctl not found"
+    result = systemctl_user(["is-active", SERVICE_NAME])
+    text = (result.stdout or result.stderr).strip()
+    return text or "inactive"
+
+
+def iio_sensor_proxy_status() -> str:
+    if not systemctl_available():
+        return "systemctl not found"
+
+    active = run_capture(["systemctl", "is-active", "iio-sensor-proxy.service"])
+    active_text = (active.stdout or active.stderr).strip()
+    if active.returncode == 0:
+        return active_text
+
+    listed = run_capture(["systemctl", "list-unit-files", "iio-sensor-proxy.service"])
+    if listed.returncode == 0 and "iio-sensor-proxy.service" in listed.stdout:
+        if active_text in {"active", "activating"}:
+            return active_text
+        return f"installed, {active_text or 'not active'}"
+    return "not available"
+
+
+def print_result(label: str, value: str) -> None:
+    print(f"{label}: {value}")
+
+
+def command_calibrate_home(_: argparse.Namespace) -> int:
+    config = read_config()
+    display = detect_display(requested="auto")
+    config["display"] = display.name
+    config["home_rotation"] = display.rotation
+    write_config(config)
+    update_state(last_display=display.name, home_rotation=display.rotation)
+    print(f"HOME calibrated to display {display.name} with rotation {display.rotation}.")
+    print(f"Config written to {CONFIG_PATH}")
+    return 0
+
+
+def command_reset(_: argparse.Namespace) -> int:
+    config = read_config()
+    command_text = reset_to_home(config, force=True)
+    print(f"Reset to HOME landscape mode using: {command_text}")
+    return 0
+
+
+def command_test_rotation(args: argparse.Namespace) -> int:
+    config = read_config()
+    target = normalize_rotation(args.rotation)
+    require_home_rotation(config)
+    display = detect_display(config)
+    command_text = shlex.join(["xrandr", "--output", display.name, "--rotate", target])
+    print(f"Testing rotation for 8 seconds: {command_text}")
+    try:
+        apply_rotation(target, config, force=True)
+        time.sleep(8)
+    finally:
+        print("Returning to HOME landscape mode.")
+        reset_to_home(config, force=True)
+    return 0
+
+
+def command_on(_: argparse.Namespace) -> int:
+    config = read_config()
+    config["enabled"] = "true"
+    write_config(config)
+    ensure_service_file()
+    import_systemd_environment()
+
+    daemon_reload = systemctl_user(["daemon-reload"])
+    if daemon_reload.returncode != 0:
+        print((daemon_reload.stderr or daemon_reload.stdout).strip())
+        return daemon_reload.returncode
+
+    enable = systemctl_user(["enable", "--now", SERVICE_NAME])
+    if enable.returncode != 0:
+        print((enable.stderr or enable.stdout).strip())
+        return enable.returncode
+
+    print("Auto-rotation is enabled.")
+    status = systemctl_user(["--no-pager", "--lines=12", "status", SERVICE_NAME])
+    print((status.stdout or status.stderr).rstrip())
+    return 0 if status.returncode in (0, 3) else status.returncode
+
+
+def command_off(_: argparse.Namespace) -> int:
+    config = read_config()
+    config["enabled"] = "false"
+    write_config(config)
+
+    stop = systemctl_user(["disable", "--now", SERVICE_NAME])
+    if stop.returncode != 0 and stop.returncode != 5:
+        detail = (stop.stderr or stop.stdout).strip()
+        if detail:
+            print(detail)
+
+    reset_failed = False
+    try:
+        command_text = reset_to_home(config, force=True)
+        print(f"Reset to HOME landscape mode using: {command_text}")
+    except AutorotateError as exc:
+        reset_failed = True
+        print(f"Could not reset to HOME: {exc}")
+
+    print("Auto-rotation is disabled. Re-enable with: chuwi-autorotate on")
+    return 1 if reset_failed else 0
+
+
+def command_status(_: argparse.Namespace) -> int:
+    config = read_config()
+    state = load_state()
+
+    print_result("enabled", config.get("enabled", "true"))
+    print_result("systemd user service", user_service_state())
+
+    try:
+        display = detect_display(config)
+        print_result("detected display output", display.name)
+        print_result("current xrandr rotation", display.rotation)
+    except AutorotateError as exc:
+        print_result("detected display output", f"unavailable ({exc})")
+        print_result("current xrandr rotation", "unknown")
+
+    print_result("saved HOME rotation", config.get("home_rotation", "auto"))
+    print_result("LightDM greeter rotation", greeter_status_summary())
+    print_result("iio-sensor-proxy status", iio_sensor_proxy_status())
+    print_result("last known sensor orientation", state.get("last_sensor_orientation", "unknown"))
+
+    devices = detect_touchscreens()
+    if devices:
+        device_text = ", ".join(f"{device['name']} (id {device['id']})" for device in devices)
+    else:
+        device_text = "none detected"
+    print_result("detected touchscreen devices", device_text)
+    return 0
+
+
+def doctor_line(status: str, label: str, detail: str, fix: Optional[str] = None) -> bool:
+    print(f"{status}: {label} - {detail}")
+    if fix:
+        print(f"  fix: {fix}")
+    return status == "OK"
+
+
+def command_doctor(_: argparse.Namespace) -> int:
+    ok = True
+
+    if command_exists("xrandr"):
+        ok &= doctor_line("OK", "xrandr", shutil.which("xrandr") or "found")
+    else:
+        ok &= doctor_line("MISSING", "xrandr", "not found", "sudo apt install x11-xserver-utils")
+
+    if command_exists("xinput"):
+        ok &= doctor_line("OK", "xinput", shutil.which("xinput") or "found")
+    else:
+        ok &= doctor_line("MISSING", "xinput", "not found", "sudo apt install xinput")
+
+    if command_exists("monitor-sensor"):
+        ok &= doctor_line("OK", "monitor-sensor", shutil.which("monitor-sensor") or "found")
+    else:
+        ok &= doctor_line(
+            "MISSING",
+            "monitor-sensor",
+            "not found",
+            "sudo apt install iio-sensor-proxy",
+        )
+
+    iio_status = iio_sensor_proxy_status()
+    if iio_status in {"active", "activating"} or iio_status.startswith("installed"):
+        ok &= doctor_line("OK", "iio-sensor-proxy service", iio_status)
+    else:
+        ok &= doctor_line(
+            "MISSING",
+            "iio-sensor-proxy service",
+            iio_status,
+            "sudo apt install iio-sensor-proxy",
+        )
+
+    display_env = os.environ.get("DISPLAY")
+    session_type = os.environ.get("XDG_SESSION_TYPE", "unknown")
+    if display_env and session_type.lower() != "wayland":
+        ok &= doctor_line("OK", "active graphical session", f"DISPLAY={display_env}, session={session_type}")
+    elif display_env and session_type.lower() == "wayland":
+        ok &= doctor_line(
+            "MISSING",
+            "active graphical session",
+            "Wayland session detected",
+            "log into the Linux Mint Xfce X11 session",
+        )
+    else:
+        ok &= doctor_line(
+            "MISSING",
+            "active graphical session",
+            "DISPLAY is not set",
+            "run this from your Xfce desktop session, not from a TTY or SSH shell",
+        )
+
+    if command_exists("xrandr") and display_env:
+        try:
+            display = detect_display(requested="auto")
+            ok &= doctor_line("OK", "connected internal display", f"{display.name}, rotation {display.rotation}")
+        except AutorotateError as exc:
+            ok &= doctor_line("MISSING", "connected internal display", str(exc), "check xrandr --query")
+    else:
+        ok &= doctor_line("MISSING", "connected internal display", "not checked", "fix xrandr/DISPLAY first")
+
+    if command_exists("xinput") and display_env:
+        devices = detect_touchscreens()
+        if devices:
+            detail = ", ".join(f"{device['name']} (id {device['id']})" for device in devices)
+            ok &= doctor_line("OK", "touchscreen device", detail)
+        else:
+            doctor_line(
+                "WARN",
+                "touchscreen device",
+                "none matched touch/touchscreen/goodix/silead/wacom",
+                "run xinput --list and add a matching name if needed",
+            )
+    else:
+        doctor_line("WARN", "touchscreen device", "not checked", "fix xinput/DISPLAY first")
+
+    print()
+    print("Package install command:")
+    print("  sudo apt install iio-sensor-proxy x11-xserver-utils xinput")
+    return 0 if ok else 1
+
+
+def monitor_reader(process: subprocess.Popen, events: "queue.Queue[Optional[str]]") -> None:
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        events.put(raw_line.rstrip("\n"))
+    events.put(None)
+
+
+def command_run(_: argparse.Namespace) -> int:
+    config = read_config()
+    if not bool_value(config.get("enabled", "true")):
+        log_event("service start skipped: enabled=false", config, also_print=True)
+        return 0
+
+    if not adopt_graphical_environment(config):
+        message = "DISPLAY is not set; auto-rotation must run inside the Xfce X11 session"
+        log_event(message, config, also_print=True)
+        return 1
+
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+        message = "Wayland session detected; this tool is X11-only"
+        log_event(message, config, also_print=True)
+        return 0 if os.environ.get("INVOCATION_ID") else 1
+
+    for command in ("xrandr", "monitor-sensor"):
+        if not command_exists(command):
+            message = f"{command} is not installed; run chuwi-autorotate doctor"
+            log_event(message, config, also_print=True)
+            return 0 if os.environ.get("INVOCATION_ID") else 1
+
+    try:
+        detect_display(config)
+    except AutorotateError as exc:
+        log_event(f"service start failed: {exc}", config, also_print=True)
+        return 1
+
+    stop_event = threading.Event()
+    previous_handlers = {}
+
+    def handle_stop(signum, _frame) -> None:
+        log_event(f"received signal {signum}; stopping", config, also_print=True)
+        stop_event.set()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, handle_stop)
+
+    log_event("service start", config, also_print=True)
+    process = subprocess.Popen(
+        ["monitor-sensor"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    events: "queue.Queue[Optional[str]]" = queue.Queue()
+    thread = threading.Thread(target=monitor_reader, args=(process, events), daemon=True)
+    thread.start()
+
+    pending: Optional[Tuple[str, str]] = None
+    deadline: Optional[float] = None
+
+    try:
+        while not stop_event.is_set():
+            timeout = 0.5
+            if pending is not None and deadline is not None:
+                timeout = max(0.0, min(0.5, deadline - time.monotonic()))
+
+            try:
+                line = events.get(timeout=timeout)
+            except queue.Empty:
+                line = ""
+
+            if line is None:
+                return_code = process.poll()
+                if stop_event.is_set():
+                    return 0
+                log_event(f"monitor-sensor exited with code {return_code}", config, also_print=True)
+                return return_code if return_code else 1
+
+            if line:
+                orientation = parse_sensor_orientation(line)
+                if orientation:
+                    config = read_config()
+                    update_state(last_sensor_orientation=orientation)
+                    try:
+                        target = map_sensor_to_rotation(orientation, config)
+                    except AutorotateError as exc:
+                        log_event(f"sensor orientation ignored: {exc}", config, also_print=True)
+                        pending = None
+                        deadline = None
+                        continue
+
+                    if target in parse_blacklist(config):
+                        log_event(
+                            f"sensor orientation {orientation} maps to blacklisted rotation {target}; skipped",
+                            config,
+                            also_print=True,
+                        )
+                        pending = None
+                        deadline = None
+                        continue
+
+                    debounce = max(0.0, get_float(config, "debounce_seconds", 1.0))
+                    pending = (orientation, target)
+                    deadline = time.monotonic() + debounce
+                    log_event(
+                        f"sensor orientation {orientation}; target rotation {target}; debounce {debounce:.2f}s",
+                        config,
+                        also_print=True,
+                    )
+
+            if pending is not None and deadline is not None and time.monotonic() >= deadline:
+                orientation, target = pending
+                config = read_config()
+                if target in parse_blacklist(config):
+                    log_event(f"pending rotation {target} is now blacklisted; skipped", config, also_print=True)
+                else:
+                    try:
+                        apply_rotation(target, config, force=False)
+                    except AutorotateError as exc:
+                        log_event(f"rotation failed: {exc}", config, also_print=True)
+
+                pending = None
+                deadline = None
+
+        return 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        log_event("service stop", config, also_print=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=APP_NAME)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("run", help="Run the monitor-sensor auto-rotation loop").set_defaults(
+        func=command_run
+    )
+    subparsers.add_parser("on", help="Enable and start the user service").set_defaults(func=command_on)
+    subparsers.add_parser("off", help="Stop, disable, and reset to HOME").set_defaults(func=command_off)
+    subparsers.add_parser("status", help="Show configuration and runtime status").set_defaults(
+        func=command_status
+    )
+    subparsers.add_parser("doctor", help="Check required tools and session state").set_defaults(
+        func=command_doctor
+    )
+    subparsers.add_parser("calibrate-home", help="Save current display and rotation as HOME").set_defaults(
+        func=command_calibrate_home
+    )
+    subparsers.add_parser("reset", help="Restore HOME display rotation and touch mapping").set_defaults(
+        func=command_reset
+    )
+    greeter_install_parser = subparsers.add_parser(
+        "greeter-install", help="Install LightDM login/lock screen rotation"
+    )
+    greeter_install_parser.add_argument(
+        "--display",
+        help="Display output for the greeter, default: saved config or auto-detected output",
+    )
+    greeter_install_parser.add_argument(
+        "--rotation",
+        choices=ROTATIONS,
+        help="Greeter rotation, default: saved HOME rotation",
+    )
+    greeter_install_parser.add_argument(
+        "--no-touch",
+        action="store_true",
+        help="Do not apply touchscreen coordinate mapping in the greeter",
+    )
+    greeter_install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the files that would be installed without changing /etc or /usr/local",
+    )
+    greeter_install_parser.set_defaults(func=command_greeter_install)
+    subparsers.add_parser(
+        "greeter-status", help="Show LightDM login/lock screen rotation status"
+    ).set_defaults(func=command_greeter_status)
+    subparsers.add_parser(
+        "greeter-uninstall", help="Remove LightDM login/lock screen rotation files"
+    ).set_defaults(func=command_greeter_uninstall)
+
+    test_parser = subparsers.add_parser(
+        "test-rotation", help="Temporarily test a rotation, then return to HOME"
+    )
+    test_parser.add_argument("rotation", choices=ROTATIONS)
+    test_parser.set_defaults(func=command_test_rotation)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        return args.func(args)
+    except AutorotateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

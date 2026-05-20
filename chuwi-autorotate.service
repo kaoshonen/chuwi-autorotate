@@ -1,0 +1,14 @@
+[Unit]
+Description=CHUWI MiniBook auto-rotation for X11/Xfce
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/chuwi-autorotate run
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
