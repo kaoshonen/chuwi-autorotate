@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import threading
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 
@@ -21,16 +24,18 @@ from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.kaoshonen.ChuwiAutorotatePanel"
 APP_NAME = "CHUWI Autorotate"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 REPOSITORY_URL = "https://github.com/kaoshonen/chuwi-autorotate"
 
 CONFIG_DIR = Path.home() / ".config" / "chuwi-autorotate"
 CONFIG_PATH = CONFIG_DIR / "config.conf"
+STATE_PATH = Path.home() / ".local" / "state" / "chuwi-autorotate" / "state.json"
 COMMAND_PATH = Path.home() / ".local" / "bin" / "chuwi-autorotate"
 LOCAL_COMMAND_PATH = Path(__file__).resolve().parent / "chuwi-autorotate"
 ICON_PATH = Path(__file__).resolve().parent / "icons" / "hicolor" / "scalable" / "apps" / "chuwi-autorotate-panel.svg"
 
 ROTATIONS = ("normal", "right", "inverted", "left")
+SENSOR_ANGLES = {"normal": 0, "right-up": 90, "bottom-up": 180, "left-up": -90}
 DEFAULT_CONFIG = OrderedDict(
     [
         ("enabled", "true"),
@@ -115,6 +120,102 @@ def write_config(config: Dict[str, str]) -> None:
     CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def read_state() -> Dict[str, str]:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def sensor_age_text(updated_at: str) -> str:
+    if not updated_at:
+        return "no sensor event recorded"
+
+    try:
+        updated = datetime.fromisoformat(updated_at)
+        now = datetime.now(updated.tzinfo) if updated.tzinfo else datetime.now()
+        seconds = max(0, int((now - updated).total_seconds()))
+    except ValueError:
+        return f"last event: {updated_at}"
+
+    if seconds < 5:
+        return "last event just now"
+    if seconds < 60:
+        return f"last event {seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"last event {minutes}m ago"
+    hours = minutes // 60
+    return f"last event {hours}h ago"
+
+
+class SensorDrawing(Gtk.DrawingArea):
+    def __init__(self) -> None:
+        super().__init__()
+        self.orientation = "unknown"
+        self.set_size_request(150, 112)
+        self.connect("draw", self.on_draw)
+
+    def set_orientation(self, orientation: str) -> None:
+        self.orientation = orientation
+        self.queue_draw()
+
+    def on_draw(self, area: Gtk.DrawingArea, context) -> bool:
+        allocation = area.get_allocation()
+        width = allocation.width
+        height = allocation.height
+        center_x = width / 2
+        center_y = height / 2
+
+        context.set_source_rgb(0.94, 0.96, 0.98)
+        rounded_rectangle(context, 8, 8, width - 16, height - 16, 10)
+        context.fill()
+
+        context.save()
+        context.translate(center_x, center_y)
+        context.rotate(math.radians(SENSOR_ANGLES.get(self.orientation, 0)))
+
+        if self.orientation not in SENSOR_ANGLES:
+            context.set_source_rgb(0.55, 0.60, 0.65)
+        else:
+            context.set_source_rgb(0.10, 0.42, 0.82)
+        rounded_rectangle(context, -42, -34, 84, 56, 7)
+        context.fill()
+
+        context.set_source_rgb(0.84, 0.91, 0.98)
+        rounded_rectangle(context, -34, -27, 68, 42, 4)
+        context.fill()
+
+        context.set_source_rgb(0.15, 0.21, 0.27)
+        rounded_rectangle(context, -52, 23, 104, 20, 5)
+        context.fill()
+
+        context.set_source_rgb(0.70, 0.77, 0.83)
+        rounded_rectangle(context, -31, 28, 62, 6, 3)
+        context.fill()
+
+        context.restore()
+
+        if self.orientation not in SENSOR_ANGLES:
+            context.set_source_rgb(0.38, 0.42, 0.46)
+            context.set_font_size(24)
+            context.move_to(center_x - 7, center_y + 9)
+            context.show_text("?")
+
+        return False
+
+
+def rounded_rectangle(context, x: float, y: float, width: float, height: float, radius: float) -> None:
+    context.new_sub_path()
+    context.arc(x + width - radius, y + radius, radius, -math.pi / 2, 0)
+    context.arc(x + width - radius, y + height - radius, radius, 0, math.pi / 2)
+    context.arc(x + radius, y + height - radius, radius, math.pi / 2, math.pi)
+    context.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+    context.close_path()
+
+
 class ControlPanel(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID)
@@ -124,6 +225,8 @@ class ControlPanel(Gtk.Application):
         self.config = read_config()
         self.loading = False
         self.busy_count = 0
+        self.sensor_state: Dict[str, str] = {}
+        self.sensor_timer_id: Optional[int] = None
 
     def do_activate(self) -> None:
         if self.window is None:
@@ -131,11 +234,20 @@ class ControlPanel(Gtk.Application):
             self.window.show_all()
         self.window.present()
         self.refresh()
+        if self.sensor_timer_id is None:
+            self.sensor_timer_id = GLib.timeout_add_seconds(1, self.update_sensor_indicator)
+        self.update_sensor_indicator()
+
+    def do_shutdown(self) -> None:
+        if self.sensor_timer_id is not None:
+            GLib.source_remove(self.sensor_timer_id)
+            self.sensor_timer_id = None
+        Gtk.Application.do_shutdown(self)
 
     def build_window(self) -> Gtk.ApplicationWindow:
         window = Gtk.ApplicationWindow(application=self)
         window.set_title(APP_NAME)
-        window.set_default_size(560, 610)
+        window.set_default_size(590, 720)
         window.set_border_width(0)
         window.set_icon_name("chuwi-autorotate-panel")
         if ICON_PATH.exists():
@@ -162,10 +274,15 @@ class ControlPanel(Gtk.Application):
         outer.set_margin_end(16)
         window.add(outer)
 
-        outer.pack_start(self.build_status_section(), False, False, 0)
-        outer.pack_start(self.build_controls_section(), False, False, 0)
-        outer.pack_start(self.build_settings_section(), False, False, 0)
-        outer.pack_start(self.build_greeter_section(), False, False, 0)
+        outer.pack_start(self.build_expander("Status", self.build_status_section(), True), False, False, 0)
+        outer.pack_start(self.build_expander("Controls", self.build_controls_section(), True), False, False, 0)
+        outer.pack_start(self.build_expander("Settings", self.build_settings_section(), False), False, False, 0)
+        outer.pack_start(
+            self.build_expander("Login/Lock Screen", self.build_greeter_section(), False),
+            False,
+            False,
+            0,
+        )
 
         self.message_label = Gtk.Label(label="")
         self.message_label.set_xalign(0)
@@ -174,14 +291,39 @@ class ControlPanel(Gtk.Application):
 
         return window
 
+    def build_expander(self, title: str, child: Gtk.Widget, expanded: bool) -> Gtk.Expander:
+        expander = Gtk.Expander(label=title)
+        expander.set_expanded(expanded)
+        expander.add(child)
+        return expander
+
     def build_status_section(self) -> Gtk.Widget:
-        frame = Gtk.Frame(label="Status")
+        frame = Gtk.Frame()
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_margin_top(12)
+        outer.set_margin_bottom(12)
+        outer.set_margin_start(12)
+        outer.set_margin_end(12)
+        frame.add(outer)
+
+        sensor_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        self.sensor_drawing = SensorDrawing()
+        sensor_box.pack_start(self.sensor_drawing, False, False, 0)
+
+        sensor_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.sensor_orientation_label = Gtk.Label(label="sensor: unknown")
+        self.sensor_orientation_label.set_xalign(0)
+        self.sensor_orientation_label.set_selectable(True)
+        self.sensor_age_label = Gtk.Label(label="no sensor event recorded")
+        self.sensor_age_label.set_xalign(0)
+        self.sensor_age_label.get_style_context().add_class("dim-label")
+        sensor_text.pack_start(self.sensor_orientation_label, False, False, 0)
+        sensor_text.pack_start(self.sensor_age_label, False, False, 0)
+        sensor_box.pack_start(sensor_text, True, True, 0)
+        outer.pack_start(sensor_box, False, False, 0)
+
         grid = Gtk.Grid(column_spacing=14, row_spacing=6)
-        grid.set_margin_top(12)
-        grid.set_margin_bottom(12)
-        grid.set_margin_start(12)
-        grid.set_margin_end(12)
-        frame.add(grid)
+        outer.pack_start(grid, False, False, 0)
 
         rows = [
             ("enabled", "Enabled"),
@@ -210,7 +352,7 @@ class ControlPanel(Gtk.Application):
         return frame
 
     def build_controls_section(self) -> Gtk.Widget:
-        frame = Gtk.Frame(label="Controls")
+        frame = Gtk.Frame()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(12)
         box.set_margin_bottom(12)
@@ -248,7 +390,7 @@ class ControlPanel(Gtk.Application):
         return frame
 
     def build_settings_section(self) -> Gtk.Widget:
-        frame = Gtk.Frame(label="Settings")
+        frame = Gtk.Frame()
         grid = Gtk.Grid(column_spacing=14, row_spacing=10)
         grid.set_margin_top(12)
         grid.set_margin_bottom(12)
@@ -292,7 +434,7 @@ class ControlPanel(Gtk.Application):
         grid.attach(widget, 1, row, 1, 1)
 
     def build_greeter_section(self) -> Gtk.Widget:
-        frame = Gtk.Frame(label="Login/Lock Screen")
+        frame = Gtk.Frame()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_margin_top(12)
         box.set_margin_bottom(12)
@@ -378,6 +520,17 @@ class ControlPanel(Gtk.Application):
         self.auto_switch.set_active(bool_value(enabled))
         self.loading = False
         self.greeter_label.set_text(self.status_values.get("LightDM greeter rotation", "unknown"))
+
+    def update_sensor_indicator(self) -> bool:
+        self.sensor_state = read_state()
+        orientation = self.sensor_state.get("last_sensor_orientation", "unknown")
+        updated_at = self.sensor_state.get("updated_at", "")
+        self.sensor_drawing.set_orientation(orientation)
+        self.sensor_orientation_label.set_text(f"sensor: {orientation}")
+        self.sensor_age_label.set_text(sensor_age_text(updated_at))
+        if "last known sensor orientation" in self.status_labels:
+            self.status_labels["last known sensor orientation"].set_text(orientation)
+        return True
 
     def on_auto_switch(self, _switch: Gtk.Switch, state: bool) -> bool:
         if self.loading:

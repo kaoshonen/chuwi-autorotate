@@ -111,7 +111,9 @@ Open the control panel from the Mint menu as `CHUWI Autorotate`, or run:
 chuwi-autorotate-panel
 ```
 
-The panel is an on-demand GTK window. It shows service/display/sensor/login-screen status, toggles the auto-rotation service, resets or calibrates HOME, runs `doctor`, edits safe config values, and installs or removes the LightDM login/lock screen rotation hook.
+The panel is an on-demand GTK window. It shows service/display/sensor/login-screen status, includes a live sensor-orientation indicator, toggles the auto-rotation service, resets or calibrates HOME, runs `doctor`, edits safe config values, and installs or removes the LightDM login/lock screen rotation hook.
+
+The `Status`, `Controls`, `Settings`, and `Login/Lock Screen` sections are collapsible. The sensor indicator reads the existing state file written by the autorotate service; it does not start a second accelerometer monitor.
 
 The About dialog says `Made by Kyle Auchterlonie 2026` and links to:
 
