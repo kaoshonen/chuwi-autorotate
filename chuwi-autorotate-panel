@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.kaoshonen.ChuwiAutorotatePanel"
 APP_NAME = "CHUWI Autorotate"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 REPOSITORY_URL = "https://github.com/kaoshonen/chuwi-autorotate"
 
 CONFIG_DIR = Path.home() / ".config" / "chuwi-autorotate"
@@ -36,6 +37,7 @@ ICON_PATH = Path(__file__).resolve().parent / "icons" / "hicolor" / "scalable" /
 
 ROTATIONS = ("normal", "right", "inverted", "left")
 SENSOR_ANGLES = {"normal": 0, "right-up": 90, "bottom-up": 180, "left-up": -90}
+TABLET_LOCK_DEVICE_NAMES = ("AT Translated Set 2 keyboard", "HID 0603:0003 Mouse")
 DEFAULT_CONFIG = OrderedDict(
     [
         ("enabled", "true"),
@@ -75,6 +77,10 @@ def run_command(args: Iterable[str], timeout: float = 30, use_pkexec: bool = Fal
     return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
 
 
+def run_process(command: List[str], timeout: float = 15) -> subprocess.CompletedProcess:
+    return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+
+
 def parse_status(output: str) -> Dict[str, str]:
     status: Dict[str, str] = {}
     for raw_line in output.splitlines():
@@ -83,6 +89,146 @@ def parse_status(output: str) -> Dict[str, str]:
         key, value = raw_line.split(": ", 1)
         status[key.strip()] = value.strip()
     return status
+
+
+def parse_xinput_devices(output: str) -> List[Dict[str, str]]:
+    devices: List[Dict[str, str]] = []
+    pattern = re.compile(r"\bid=(\d+)\s+\[([^\]]+)\]")
+    for line in output.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        raw_name = line[: match.start()].strip()
+        name = re.sub(r"^[^\w]+", "", raw_name).strip()
+        devices.append({"name": name, "id": match.group(1), "type": match.group(2).strip()})
+    return devices
+
+
+def discover_tablet_lock_devices() -> Dict[str, object]:
+    xinput = shutil.which("xinput")
+    if not xinput:
+        return {
+            "available": False,
+            "error": "xinput is not installed",
+            "xinput": "",
+            "devices": [],
+            "missing": list(TABLET_LOCK_DEVICE_NAMES),
+        }
+
+    result = run_process([xinput, "--list", "--short"], timeout=5)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or "xinput --list failed"
+        return {
+            "available": False,
+            "error": detail,
+            "xinput": xinput,
+            "devices": [],
+            "missing": list(TABLET_LOCK_DEVICE_NAMES),
+        }
+
+    all_devices = parse_xinput_devices(result.stdout)
+    matched: List[Dict[str, str]] = []
+    missing: List[str] = []
+    for target_name in TABLET_LOCK_DEVICE_NAMES:
+        device = next((candidate for candidate in all_devices if candidate["name"] == target_name), None)
+        if device:
+            matched.append(device)
+        else:
+            missing.append(target_name)
+
+    return {
+        "available": True,
+        "error": "",
+        "xinput": xinput,
+        "devices": matched,
+        "missing": missing,
+    }
+
+
+def xinput_device_enabled(xinput: str, device_id: str) -> Optional[bool]:
+    result = run_process([xinput, "list-props", device_id], timeout=5)
+    if result.returncode != 0:
+        return None
+
+    for line in result.stdout.splitlines():
+        if "Device Enabled" not in line or ":" not in line:
+            continue
+        value = line.rsplit(":", 1)[1].strip().split()
+        if not value:
+            return None
+        return value[0] == "1"
+    return None
+
+
+def tablet_lock_status() -> Dict[str, object]:
+    discovery = discover_tablet_lock_devices()
+    devices: List[Dict[str, object]] = []
+    xinput = str(discovery.get("xinput", ""))
+
+    for device in discovery.get("devices", []):
+        item = dict(device)
+        item["enabled"] = xinput_device_enabled(xinput, str(item["id"])) if xinput else None
+        devices.append(item)
+
+    disabled_count = sum(1 for device in devices if device.get("enabled") is False)
+    locked = (
+        bool(devices)
+        and disabled_count == len(TABLET_LOCK_DEVICE_NAMES)
+        and not discovery.get("missing")
+    )
+    partial = disabled_count > 0 and not locked
+
+    return {
+        "available": bool(discovery.get("available")),
+        "error": discovery.get("error", ""),
+        "devices": devices,
+        "missing": discovery.get("missing", []),
+        "locked": locked,
+        "partial": partial,
+    }
+
+
+def tablet_lock_status_process() -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        ["xinput", "tablet-lock-status"],
+        0,
+        json.dumps(tablet_lock_status()),
+        "",
+    )
+
+
+def set_tablet_lock_process(lock: bool) -> subprocess.CompletedProcess:
+    discovery = discover_tablet_lock_devices()
+    devices = discovery.get("devices", [])
+    missing = discovery.get("missing", [])
+    xinput = str(discovery.get("xinput", ""))
+
+    if not discovery.get("available"):
+        detail = str(discovery.get("error", "xinput is unavailable"))
+        return subprocess.CompletedProcess([], 1, json.dumps(tablet_lock_status()), detail)
+
+    if lock and missing:
+        detail = "Missing expected internal input devices: " + ", ".join(str(name) for name in missing)
+        return subprocess.CompletedProcess([], 1, json.dumps(tablet_lock_status()), detail)
+
+    if not devices:
+        return subprocess.CompletedProcess([], 1, json.dumps(tablet_lock_status()), "No matching input devices found")
+
+    action = "disable" if lock else "enable"
+    failures: List[str] = []
+    for device in devices:
+        result = run_process([xinput, action, str(device["id"])], timeout=5)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip() or f"xinput {action} failed"
+            failures.append(f"{device['name']}: {detail}")
+
+    status = tablet_lock_status()
+    return subprocess.CompletedProcess(
+        [xinput, action],
+        1 if failures else 0,
+        json.dumps(status),
+        "\n".join(failures),
+    )
 
 
 def read_config() -> OrderedDict:
@@ -227,6 +373,8 @@ class ControlPanel(Gtk.Application):
         self.busy_count = 0
         self.sensor_state: Dict[str, str] = {}
         self.sensor_timer_id: Optional[int] = None
+        self.tablet_lock_active = False
+        self.tablet_lock_partial = False
 
     def do_activate(self) -> None:
         if self.window is None:
@@ -267,15 +415,20 @@ class ControlPanel(Gtk.Application):
         about_button.connect("clicked", self.show_about)
         header.pack_end(about_button)
 
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        window.add(scroller)
+
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         outer.set_margin_top(16)
         outer.set_margin_bottom(16)
         outer.set_margin_start(16)
         outer.set_margin_end(16)
-        window.add(outer)
+        scroller.add(outer)
 
         outer.pack_start(self.build_expander("Status", self.build_status_section(), True), False, False, 0)
         outer.pack_start(self.build_expander("Controls", self.build_controls_section(), True), False, False, 0)
+        outer.pack_start(self.build_expander("Tablet Mode", self.build_tablet_section(), True), False, False, 0)
         outer.pack_start(self.build_expander("Settings", self.build_settings_section(), False), False, False, 0)
         outer.pack_start(
             self.build_expander("Login/Lock Screen", self.build_greeter_section(), False),
@@ -389,6 +542,34 @@ class ControlPanel(Gtk.Application):
         box.pack_start(buttons, False, False, 0)
         return frame
 
+    def build_tablet_section(self) -> Gtk.Widget:
+        frame = Gtk.Frame()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        frame.add(box)
+
+        self.tablet_lock_status_label = Gtk.Label(label="Tablet input lock: unknown")
+        self.tablet_lock_status_label.set_xalign(0)
+        self.tablet_lock_status_label.set_line_wrap(True)
+        self.tablet_lock_status_label.set_selectable(True)
+        box.pack_start(self.tablet_lock_status_label, False, False, 0)
+
+        self.tablet_lock_devices_label = Gtk.Label(label="Targets: internal keyboard and pointer")
+        self.tablet_lock_devices_label.set_xalign(0)
+        self.tablet_lock_devices_label.set_line_wrap(True)
+        self.tablet_lock_devices_label.get_style_context().add_class("dim-label")
+        box.pack_start(self.tablet_lock_devices_label, False, False, 0)
+
+        self.tablet_lock_button = Gtk.Button.new_with_label("Enable Tablet Input Lock")
+        self.tablet_lock_button.set_size_request(-1, 72)
+        self.tablet_lock_button.connect("clicked", self.on_tablet_lock_button)
+        box.pack_start(self.tablet_lock_button, False, False, 0)
+
+        return frame
+
     def build_settings_section(self) -> Gtk.Widget:
         frame = Gtk.Frame()
         grid = Gtk.Grid(column_spacing=14, row_spacing=10)
@@ -487,6 +668,7 @@ class ControlPanel(Gtk.Application):
                 self.set_message(f"Could not refresh status: {detail}")
 
         self.run_background(work, done)
+        self.refresh_tablet_lock_status()
 
     def load_config_into_widgets(self) -> None:
         self.loading = True
@@ -520,6 +702,88 @@ class ControlPanel(Gtk.Application):
         self.auto_switch.set_active(bool_value(enabled))
         self.loading = False
         self.greeter_label.set_text(self.status_values.get("LightDM greeter rotation", "unknown"))
+
+    def refresh_tablet_lock_status(self) -> None:
+        def work() -> subprocess.CompletedProcess:
+            return tablet_lock_status_process()
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            self.apply_tablet_lock_status_result(result)
+
+        self.run_background(work, done, busy=False)
+
+    def apply_tablet_lock_status_result(self, result: subprocess.CompletedProcess) -> None:
+        try:
+            status = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            status = {
+                "available": False,
+                "error": "Could not read tablet input lock status",
+                "devices": [],
+                "missing": list(TABLET_LOCK_DEVICE_NAMES),
+                "locked": False,
+                "partial": False,
+            }
+        self.apply_tablet_lock_status(status)
+
+    def apply_tablet_lock_status(self, status: Dict[str, object]) -> None:
+        devices = status.get("devices", [])
+        missing = status.get("missing", [])
+        available = bool(status.get("available"))
+        locked = bool(status.get("locked"))
+        partial = bool(status.get("partial"))
+        self.tablet_lock_active = locked
+        self.tablet_lock_partial = partial
+
+        if not available:
+            error = str(status.get("error", "xinput is unavailable"))
+            status_text = f"Tablet input lock unavailable: {error}"
+        elif locked:
+            status_text = "Tablet input lock is ON for this session. Touchscreen and power button remain active."
+        elif partial:
+            status_text = "Tablet input lock is partially active. Use Unlock to return all matched devices to normal."
+        else:
+            status_text = "Tablet input lock is OFF. Restarting or logging in starts with normal input."
+
+        device_parts: List[str] = []
+        for device in (devices if isinstance(devices, list) else []):
+            if not isinstance(device, dict):
+                continue
+            enabled = device.get("enabled")
+            state = "enabled" if enabled is True else "disabled" if enabled is False else "unknown"
+            device_parts.append(f"{device.get('name', 'unknown')} ({state})")
+        if missing:
+            device_parts.append("missing: " + ", ".join(str(name) for name in missing))
+
+        self.tablet_lock_status_label.set_text(status_text)
+        self.tablet_lock_devices_label.set_text(
+            "Targets: " + "; ".join(device_parts) if device_parts else "Targets: internal keyboard and pointer"
+        )
+
+        should_unlock = locked or partial
+        self.tablet_lock_button.set_label(
+            "Unlock Keyboard and Pointer" if should_unlock else "Enable Tablet Input Lock"
+        )
+        self.tablet_lock_button.set_sensitive(available and (bool(devices) or should_unlock))
+
+    def on_tablet_lock_button(self, _button: Gtk.Button) -> None:
+        lock = not (self.tablet_lock_active or self.tablet_lock_partial)
+
+        def work() -> subprocess.CompletedProcess:
+            return set_tablet_lock_process(lock)
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            self.apply_tablet_lock_status_result(result)
+            if result.returncode == 0:
+                if lock:
+                    self.set_message("Tablet input lock enabled for this session only.")
+                else:
+                    self.set_message("Keyboard and pointer unlocked.")
+            else:
+                detail = (result.stderr or result.stdout).strip()
+                self.set_message(f"Tablet input lock failed.\n{detail}")
+
+        self.run_background(work, done)
 
     def update_sensor_indicator(self) -> bool:
         self.sensor_state = read_state()
@@ -627,15 +891,17 @@ class ControlPanel(Gtk.Application):
         self,
         work: Callable[[], subprocess.CompletedProcess],
         done: Callable[[subprocess.CompletedProcess], None],
+        busy: bool = True,
     ) -> None:
-        self.set_busy(True)
+        if busy:
+            self.set_busy(True)
 
         def target() -> None:
             try:
                 result = work()
             except Exception as exc:  # noqa: BLE001 - report unexpected GUI action failures.
                 result = subprocess.CompletedProcess([], 1, "", str(exc))
-            GLib.idle_add(self.finish_background, done, result)
+            GLib.idle_add(self.finish_background, done, result, busy)
 
         threading.Thread(target=target, daemon=True).start()
 
@@ -643,11 +909,13 @@ class ControlPanel(Gtk.Application):
         self,
         done: Callable[[subprocess.CompletedProcess], None],
         result: subprocess.CompletedProcess,
+        busy: bool,
     ) -> bool:
         try:
             done(result)
         finally:
-            self.set_busy(False)
+            if busy:
+                self.set_busy(False)
         return False
 
 
