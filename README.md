@@ -7,6 +7,9 @@ This tool uses `monitor-sensor` from `iio-sensor-proxy` for accelerometer orient
 ## Files and Paths
 
 - Command: `~/.local/bin/chuwi-autorotate`
+- Control panel: `~/.local/bin/chuwi-autorotate-panel`
+- Desktop launcher: `~/.local/share/applications/chuwi-autorotate-panel.desktop`
+- Panel icon: `~/.local/share/icons/hicolor/scalable/apps/chuwi-autorotate-panel.svg`
 - Config: `~/.config/chuwi-autorotate/config.conf`
 - User service: `~/.config/systemd/user/chuwi-autorotate.service`
 - Log: `~/.local/state/chuwi-autorotate/chuwi-autorotate.log`
@@ -16,7 +19,7 @@ This tool uses `monitor-sensor` from `iio-sensor-proxy` for accelerometer orient
 Install required packages if needed:
 
 ```bash
-sudo apt install iio-sensor-proxy x11-xserver-utils xinput
+sudo apt install iio-sensor-proxy x11-xserver-utils xinput python3-gi gir1.2-gtk-3.0
 ```
 
 Install the utility:
@@ -99,6 +102,22 @@ chuwi-autorotate doctor
 `status` shows enabled state, user service state, detected output, current rotation, saved HOME rotation, LightDM greeter rotation status, `iio-sensor-proxy` status, last sensor orientation, and touchscreen devices.
 
 `doctor` checks for `xrandr`, `xinput`, `monitor-sensor`, `iio-sensor-proxy`, an active X11 graphical session, an internal display, and a touchscreen.
+
+## Control Panel
+
+Open the control panel from the Mint menu as `CHUWI Autorotate`, or run:
+
+```bash
+chuwi-autorotate-panel
+```
+
+The panel is an on-demand GTK window. It shows service/display/sensor/login-screen status, toggles the auto-rotation service, resets or calibrates HOME, runs `doctor`, edits safe config values, and installs or removes the LightDM login/lock screen rotation hook.
+
+The About dialog says `Made by Kyle Auchterlonie 2026` and links to:
+
+```text
+https://github.com/kaoshonen/chuwi-autorotate
+```
 
 ## Login and Lock Screen Rotation
 

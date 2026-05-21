@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CHUWI Autorotate
+Comment=Control panel for CHUWI screen autorotation
+Exec=chuwi-autorotate-panel
+Icon=chuwi-autorotate-panel
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=rotation;screen;display;touchscreen;CHUWI;

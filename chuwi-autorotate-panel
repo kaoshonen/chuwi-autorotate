@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""GTK control panel for chuwi-autorotate."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import threading
+from collections import OrderedDict
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk, Pango  # noqa: E402
+
+
+APP_ID = "io.github.kaoshonen.ChuwiAutorotatePanel"
+APP_NAME = "CHUWI Autorotate"
+APP_VERSION = "0.1.0"
+REPOSITORY_URL = "https://github.com/kaoshonen/chuwi-autorotate"
+
+CONFIG_DIR = Path.home() / ".config" / "chuwi-autorotate"
+CONFIG_PATH = CONFIG_DIR / "config.conf"
+COMMAND_PATH = Path.home() / ".local" / "bin" / "chuwi-autorotate"
+LOCAL_COMMAND_PATH = Path(__file__).resolve().parent / "chuwi-autorotate"
+ICON_PATH = Path(__file__).resolve().parent / "icons" / "hicolor" / "scalable" / "apps" / "chuwi-autorotate-panel.svg"
+
+ROTATIONS = ("normal", "right", "inverted", "left")
+DEFAULT_CONFIG = OrderedDict(
+    [
+        ("enabled", "true"),
+        ("display", "auto"),
+        ("home_rotation", "auto"),
+        ("orientation_offset", "right"),
+        ("touch_enabled", "true"),
+        ("debounce_seconds", "1.0"),
+        ("startup_wait_seconds", "90"),
+        ("blacklist_rotations", ""),
+        ("log_file", "~/.local/state/chuwi-autorotate/chuwi-autorotate.log"),
+    ]
+)
+
+
+def bool_value(value: str) -> bool:
+    return value.strip().lower() in {"1", "yes", "true", "on", "enabled"}
+
+
+def command_path() -> str:
+    discovered = shutil.which("chuwi-autorotate")
+    if discovered:
+        return discovered
+    if COMMAND_PATH.exists():
+        return str(COMMAND_PATH)
+    return str(LOCAL_COMMAND_PATH)
+
+
+def run_command(args: Iterable[str], timeout: float = 30, use_pkexec: bool = False) -> subprocess.CompletedProcess:
+    command: List[str] = [command_path(), *args]
+    if use_pkexec:
+        pkexec = shutil.which("pkexec")
+        if not pkexec:
+            return subprocess.CompletedProcess(command, 127, "", "pkexec is not installed")
+        command = [pkexec, *command]
+
+    return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+
+
+def parse_status(output: str) -> Dict[str, str]:
+    status: Dict[str, str] = {}
+    for raw_line in output.splitlines():
+        if ": " not in raw_line:
+            continue
+        key, value = raw_line.split(": ", 1)
+        status[key.strip()] = value.strip()
+    return status
+
+
+def read_config() -> OrderedDict:
+    config = OrderedDict(DEFAULT_CONFIG)
+    extras = OrderedDict()
+
+    if CONFIG_PATH.exists():
+        for raw_line in CONFIG_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key in config:
+                config[key] = value
+            else:
+                extras[key] = value
+
+    for key, value in extras.items():
+        config[key] = value
+    return config
+
+
+def write_config(config: Dict[str, str]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lines: List[str] = []
+    for key, default_value in DEFAULT_CONFIG.items():
+        lines.append(f"{key}={config.get(key, default_value)}")
+
+    for key, value in config.items():
+        if key not in DEFAULT_CONFIG:
+            lines.append(f"{key}={value}")
+
+    CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class ControlPanel(Gtk.Application):
+    def __init__(self) -> None:
+        super().__init__(application_id=APP_ID)
+        self.window: Optional[Gtk.ApplicationWindow] = None
+        self.status_labels: Dict[str, Gtk.Label] = {}
+        self.status_values: Dict[str, str] = {}
+        self.config = read_config()
+        self.loading = False
+        self.busy_count = 0
+
+    def do_activate(self) -> None:
+        if self.window is None:
+            self.window = self.build_window()
+        self.window.present()
+        self.refresh()
+
+    def build_window(self) -> Gtk.ApplicationWindow:
+        window = Gtk.ApplicationWindow(application=self)
+        window.set_title(APP_NAME)
+        window.set_default_size(560, 610)
+        window.set_border_width(0)
+        window.set_icon_name("chuwi-autorotate-panel")
+        if ICON_PATH.exists():
+            window.set_icon_from_file(str(ICON_PATH))
+
+        header = Gtk.HeaderBar(title=APP_NAME)
+        header.set_show_close_button(True)
+        window.set_titlebar(header)
+
+        refresh_button = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh_button.set_tooltip_text("Refresh status")
+        refresh_button.connect("clicked", lambda _button: self.refresh())
+        header.pack_start(refresh_button)
+
+        about_button = Gtk.Button.new_from_icon_name("help-about-symbolic", Gtk.IconSize.BUTTON)
+        about_button.set_tooltip_text("About")
+        about_button.connect("clicked", self.show_about)
+        header.pack_end(about_button)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.set_margin_top(16)
+        outer.set_margin_bottom(16)
+        outer.set_margin_start(16)
+        outer.set_margin_end(16)
+        window.add(outer)
+
+        outer.pack_start(self.build_status_section(), False, False, 0)
+        outer.pack_start(self.build_controls_section(), False, False, 0)
+        outer.pack_start(self.build_settings_section(), False, False, 0)
+        outer.pack_start(self.build_greeter_section(), False, False, 0)
+
+        self.message_label = Gtk.Label(label="")
+        self.message_label.set_xalign(0)
+        self.message_label.set_line_wrap(True)
+        outer.pack_start(self.message_label, False, False, 0)
+
+        return window
+
+    def build_status_section(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="Status")
+        grid = Gtk.Grid(column_spacing=14, row_spacing=6)
+        grid.set_margin_top(12)
+        grid.set_margin_bottom(12)
+        grid.set_margin_start(12)
+        grid.set_margin_end(12)
+        frame.add(grid)
+
+        rows = [
+            ("enabled", "Enabled"),
+            ("systemd user service", "Service"),
+            ("detected display output", "Display"),
+            ("current xrandr rotation", "Current rotation"),
+            ("saved HOME rotation", "HOME rotation"),
+            ("last known sensor orientation", "Sensor"),
+            ("LightDM greeter rotation", "Login/lock screen"),
+            ("iio-sensor-proxy status", "Sensor service"),
+            ("detected touchscreen devices", "Touch devices"),
+        ]
+
+        for row, (key, label_text) in enumerate(rows):
+            label = Gtk.Label(label=label_text)
+            label.set_xalign(0)
+            label.get_style_context().add_class("dim-label")
+            value = Gtk.Label(label="unknown")
+            value.set_xalign(0)
+            value.set_selectable(True)
+            value.set_ellipsize(Pango.EllipsizeMode.END)
+            grid.attach(label, 0, row, 1, 1)
+            grid.attach(value, 1, row, 1, 1)
+            self.status_labels[key] = value
+
+        return frame
+
+    def build_controls_section(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="Controls")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        frame.add(box)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.auto_switch = Gtk.Switch()
+        self.auto_switch.connect("state-set", self.on_auto_switch)
+        row.pack_start(Gtk.Label(label="Auto-rotation service", xalign=0), True, True, 0)
+        row.pack_end(self.auto_switch, False, False, 0)
+        box.pack_start(row, False, False, 0)
+
+        buttons = Gtk.ButtonBox(orientation=Gtk.Orientation.HORIZONTAL)
+        buttons.set_layout(Gtk.ButtonBoxStyle.START)
+        buttons.set_spacing(8)
+
+        reset_button = Gtk.Button.new_with_label("Reset to HOME")
+        reset_button.connect("clicked", lambda _button: self.run_action(["reset"], "Reset to HOME complete."))
+        buttons.add(reset_button)
+
+        calibrate_button = Gtk.Button.new_with_label("Calibrate HOME")
+        calibrate_button.connect(
+            "clicked",
+            lambda _button: self.run_action(["calibrate-home"], "HOME calibration complete.", refresh_config=True),
+        )
+        buttons.add(calibrate_button)
+
+        doctor_button = Gtk.Button.new_with_label("Doctor")
+        doctor_button.connect("clicked", self.run_doctor)
+        buttons.add(doctor_button)
+
+        box.pack_start(buttons, False, False, 0)
+        return frame
+
+    def build_settings_section(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="Settings")
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        grid.set_margin_top(12)
+        grid.set_margin_bottom(12)
+        grid.set_margin_start(12)
+        grid.set_margin_end(12)
+        frame.add(grid)
+
+        self.touch_switch = Gtk.Switch()
+        self.offset_combo = Gtk.ComboBoxText()
+        for rotation in ROTATIONS:
+            self.offset_combo.append_text(rotation)
+
+        self.debounce_spin = Gtk.SpinButton.new_with_range(0.0, 10.0, 0.1)
+        self.debounce_spin.set_digits(1)
+        self.startup_wait_spin = Gtk.SpinButton.new_with_range(0, 300, 5)
+        self.startup_wait_spin.set_digits(0)
+
+        self.blacklist_checks: Dict[str, Gtk.CheckButton] = {}
+        blacklist_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for rotation in ROTATIONS:
+            check = Gtk.CheckButton(label=rotation)
+            self.blacklist_checks[rotation] = check
+            blacklist_box.pack_start(check, False, False, 0)
+
+        self.add_setting_row(grid, 0, "Touchscreen mapping", self.touch_switch)
+        self.add_setting_row(grid, 1, "Orientation offset", self.offset_combo)
+        self.add_setting_row(grid, 2, "Debounce seconds", self.debounce_spin)
+        self.add_setting_row(grid, 3, "Startup wait seconds", self.startup_wait_spin)
+        self.add_setting_row(grid, 4, "Blacklist rotations", blacklist_box)
+
+        save_button = Gtk.Button.new_with_label("Save Settings")
+        save_button.connect("clicked", self.save_settings)
+        grid.attach(save_button, 1, 5, 1, 1)
+        return frame
+
+    def add_setting_row(self, grid: Gtk.Grid, row: int, label_text: str, widget: Gtk.Widget) -> None:
+        label = Gtk.Label(label=label_text)
+        label.set_xalign(0)
+        label.get_style_context().add_class("dim-label")
+        grid.attach(label, 0, row, 1, 1)
+        grid.attach(widget, 1, row, 1, 1)
+
+    def build_greeter_section(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="Login/Lock Screen")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        frame.add(box)
+
+        self.greeter_label = Gtk.Label(label="unknown")
+        self.greeter_label.set_xalign(0)
+        self.greeter_label.set_selectable(True)
+        box.pack_start(self.greeter_label, False, False, 0)
+
+        buttons = Gtk.ButtonBox(orientation=Gtk.Orientation.HORIZONTAL)
+        buttons.set_layout(Gtk.ButtonBoxStyle.START)
+        buttons.set_spacing(8)
+
+        install_button = Gtk.Button.new_with_label("Install/Update")
+        install_button.connect("clicked", self.install_greeter)
+        buttons.add(install_button)
+
+        remove_button = Gtk.Button.new_with_label("Remove")
+        remove_button.connect("clicked", self.remove_greeter)
+        buttons.add(remove_button)
+
+        box.pack_start(buttons, False, False, 0)
+        return frame
+
+    def set_busy(self, busy: bool) -> None:
+        self.busy_count += 1 if busy else -1
+        self.busy_count = max(0, self.busy_count)
+        if self.window:
+            self.window.set_sensitive(self.busy_count == 0)
+
+    def set_message(self, message: str) -> None:
+        self.message_label.set_text(message)
+
+    def refresh(self) -> None:
+        self.config = read_config()
+        self.load_config_into_widgets()
+
+        def work() -> subprocess.CompletedProcess:
+            return run_command(["status"], timeout=15)
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            if result.returncode == 0:
+                self.status_values = parse_status(result.stdout)
+                self.update_status_labels()
+            else:
+                detail = (result.stderr or result.stdout).strip()
+                self.set_message(f"Could not refresh status: {detail}")
+
+        self.run_background(work, done)
+
+    def load_config_into_widgets(self) -> None:
+        self.loading = True
+        try:
+            self.touch_switch.set_active(bool_value(self.config.get("touch_enabled", "true")))
+            offset = self.config.get("orientation_offset", "right")
+            self.offset_combo.set_active(ROTATIONS.index(offset) if offset in ROTATIONS else 1)
+            self.debounce_spin.set_value(float(self.config.get("debounce_seconds", "1.0")))
+            self.startup_wait_spin.set_value(float(self.config.get("startup_wait_seconds", "90")))
+
+            blacklist = {
+                value
+                for value in self.config.get("blacklist_rotations", "").replace(",", " ").split()
+                if value in ROTATIONS
+            }
+            for rotation, check in self.blacklist_checks.items():
+                check.set_active(rotation in blacklist)
+
+            self.auto_switch.set_active(bool_value(self.config.get("enabled", "true")))
+        except ValueError:
+            pass
+        finally:
+            self.loading = False
+
+    def update_status_labels(self) -> None:
+        for key, label in self.status_labels.items():
+            label.set_text(self.status_values.get(key, "unknown"))
+
+        enabled = self.status_values.get("enabled", self.config.get("enabled", "false"))
+        self.loading = True
+        self.auto_switch.set_active(bool_value(enabled))
+        self.loading = False
+        self.greeter_label.set_text(self.status_values.get("LightDM greeter rotation", "unknown"))
+
+    def on_auto_switch(self, _switch: Gtk.Switch, state: bool) -> bool:
+        if self.loading:
+            return False
+        command = ["on"] if state else ["off"]
+        message = "Auto-rotation enabled." if state else "Auto-rotation disabled and reset to HOME."
+        self.run_action(command, message, refresh_config=True)
+        return False
+
+    def save_settings(self, _button: Gtk.Button) -> None:
+        config = read_config()
+        config["touch_enabled"] = "true" if self.touch_switch.get_active() else "false"
+        active_offset = self.offset_combo.get_active_text()
+        config["orientation_offset"] = active_offset or config.get("orientation_offset", "right")
+        config["debounce_seconds"] = f"{self.debounce_spin.get_value():.1f}"
+        config["startup_wait_seconds"] = str(int(self.startup_wait_spin.get_value()))
+        blacklist = [
+            rotation for rotation, check in self.blacklist_checks.items() if check.get_active()
+        ]
+        config["blacklist_rotations"] = " ".join(blacklist)
+        write_config(config)
+        self.config = config
+        self.set_message("Settings saved.")
+        self.refresh()
+
+    def run_action(
+        self,
+        args: List[str],
+        success_message: str,
+        refresh_config: bool = False,
+        use_pkexec: bool = False,
+    ) -> None:
+        def work() -> subprocess.CompletedProcess:
+            return run_command(args, timeout=45, use_pkexec=use_pkexec)
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            if refresh_config:
+                self.config = read_config()
+            if result.returncode == 0:
+                detail = result.stdout.strip()
+                self.set_message(success_message if not detail else f"{success_message}\n{detail}")
+            else:
+                detail = (result.stderr or result.stdout).strip()
+                self.set_message(f"Command failed: {' '.join(args)}\n{detail}")
+            self.refresh()
+
+        self.run_background(work, done)
+
+    def run_doctor(self, _button: Gtk.Button) -> None:
+        def work() -> subprocess.CompletedProcess:
+            return run_command(["doctor"], timeout=20)
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            dialog = Gtk.MessageDialog(
+                transient_for=self.window,
+                modal=True,
+                message_type=Gtk.MessageType.INFO if result.returncode == 0 else Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.CLOSE,
+                text="Doctor",
+            )
+            dialog.format_secondary_text((result.stdout or result.stderr).strip())
+            dialog.run()
+            dialog.destroy()
+            self.refresh()
+
+        self.run_background(work, done)
+
+    def install_greeter(self, _button: Gtk.Button) -> None:
+        display = self.config.get("display", "auto")
+        rotation = self.config.get("home_rotation", "auto")
+        if rotation not in ROTATIONS:
+            self.set_message("Calibrate HOME before installing login/lock screen rotation.")
+            return
+        args = ["greeter-install", "--display", display, "--rotation", rotation]
+        self.run_action(args, "Login/lock screen rotation installed.", use_pkexec=True)
+
+    def remove_greeter(self, _button: Gtk.Button) -> None:
+        self.run_action(["greeter-uninstall"], "Login/lock screen rotation removed.", use_pkexec=True)
+
+    def show_about(self, _button: Gtk.Button) -> None:
+        dialog = Gtk.AboutDialog(transient_for=self.window, modal=True)
+        dialog.set_program_name(APP_NAME)
+        dialog.set_version(APP_VERSION)
+        dialog.set_comments("Control panel for CHUWI MiniBook automatic screen rotation.")
+        dialog.set_copyright("Made by Kyle Auchterlonie 2026")
+        dialog.set_website(REPOSITORY_URL)
+        dialog.set_website_label(REPOSITORY_URL)
+        dialog.set_authors(["Kyle Auchterlonie"])
+        dialog.set_logo_icon_name("chuwi-autorotate-panel")
+        dialog.run()
+        dialog.destroy()
+
+    def run_background(
+        self,
+        work: Callable[[], subprocess.CompletedProcess],
+        done: Callable[[subprocess.CompletedProcess], None],
+    ) -> None:
+        self.set_busy(True)
+
+        def target() -> None:
+            try:
+                result = work()
+            except Exception as exc:  # noqa: BLE001 - report unexpected GUI action failures.
+                result = subprocess.CompletedProcess([], 1, "", str(exc))
+            GLib.idle_add(self.finish_background, done, result)
+
+        threading.Thread(target=target, daemon=True).start()
+
+    def finish_background(
+        self,
+        done: Callable[[subprocess.CompletedProcess], None],
+        result: subprocess.CompletedProcess,
+    ) -> bool:
+        try:
+            done(result)
+        finally:
+            self.set_busy(False)
+        return False
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="chuwi-autorotate-panel")
+    parser.add_argument("--version", action="store_true", help="Print version and exit")
+    args, remaining = parser.parse_known_args(argv)
+    if args.version:
+        print(f"{APP_NAME} {APP_VERSION}")
+        return 0
+
+    app = ControlPanel()
+    return app.run([sys.argv[0], *remaining])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

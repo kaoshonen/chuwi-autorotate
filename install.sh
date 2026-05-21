@@ -7,10 +7,17 @@ bin_dir="$HOME/.local/bin"
 config_dir="$HOME/.config/chuwi-autorotate"
 state_dir="$HOME/.local/state/chuwi-autorotate"
 service_dir="$HOME/.config/systemd/user"
+applications_dir="$HOME/.local/share/applications"
+icon_dir="$HOME/.local/share/icons/hicolor/scalable/apps"
+desktop_file="$applications_dir/chuwi-autorotate-panel.desktop"
 
-install -d "$bin_dir" "$config_dir" "$state_dir" "$service_dir"
+install -d "$bin_dir" "$config_dir" "$state_dir" "$service_dir" "$applications_dir" "$icon_dir"
 install -m 0755 "$script_dir/chuwi-autorotate" "$bin_dir/chuwi-autorotate"
+install -m 0755 "$script_dir/chuwi-autorotate-panel" "$bin_dir/chuwi-autorotate-panel"
 install -m 0644 "$script_dir/chuwi-autorotate.service" "$service_dir/chuwi-autorotate.service"
+install -m 0644 "$script_dir/chuwi-autorotate-panel.desktop" "$desktop_file"
+sed -i "s|^Exec=.*|Exec=$bin_dir/chuwi-autorotate-panel|" "$desktop_file"
+install -m 0644 "$script_dir/icons/hicolor/scalable/apps/chuwi-autorotate-panel.svg" "$icon_dir/chuwi-autorotate-panel.svg"
 
 "$bin_dir/chuwi-autorotate" calibrate-home
 
@@ -45,6 +52,14 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl --user daemon-reload || true
 fi
 
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$applications_dir" >/dev/null 2>&1 || true
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+fi
+
 cat <<EOF
 
 Installed chuwi-autorotate.
@@ -61,4 +76,7 @@ Disable auto-rotation and reset to HOME:
 
 Emergency reset to HOME:
   $chuwi_cmd reset
+
+Open the control panel:
+  chuwi-autorotate-panel
 EOF
