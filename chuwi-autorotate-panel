@@ -25,12 +25,14 @@ from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.kaoshonen.ChuwiAutorotatePanel"
 APP_NAME = "CHUWI Autorotate"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 REPOSITORY_URL = "https://github.com/kaoshonen/chuwi-autorotate"
 
 CONFIG_DIR = Path.home() / ".config" / "chuwi-autorotate"
 CONFIG_PATH = CONFIG_DIR / "config.conf"
 STATE_PATH = Path.home() / ".local" / "state" / "chuwi-autorotate" / "state.json"
+STATE_DIR = STATE_PATH.parent
+ONBOARD_RESTORE_PATH = STATE_DIR / "onboard-tablet-keyboard.json"
 COMMAND_PATH = Path.home() / ".local" / "bin" / "chuwi-autorotate"
 LOCAL_COMMAND_PATH = Path(__file__).resolve().parent / "chuwi-autorotate"
 ICON_PATH = Path(__file__).resolve().parent / "icons" / "hicolor" / "scalable" / "apps" / "chuwi-autorotate-panel.svg"
@@ -38,6 +40,10 @@ ICON_PATH = Path(__file__).resolve().parent / "icons" / "hicolor" / "scalable" /
 ROTATIONS = ("normal", "right", "inverted", "left")
 SENSOR_ANGLES = {"normal": 0, "right-up": 90, "bottom-up": 180, "left-up": -90}
 TABLET_LOCK_DEVICE_NAMES = ("AT Translated Set 2 keyboard", "HID 0603:0003 Mouse")
+ONBOARD_SCHEMA = "org.onboard.auto-show"
+ONBOARD_AUTO_SHOW_KEY = "enabled"
+GNOME_INTERFACE_SCHEMA = "org.gnome.desktop.interface"
+TOOLKIT_ACCESSIBILITY_KEY = "toolkit-accessibility"
 DEFAULT_CONFIG = OrderedDict(
     [
         ("enabled", "true"),
@@ -45,6 +51,7 @@ DEFAULT_CONFIG = OrderedDict(
         ("home_rotation", "auto"),
         ("orientation_offset", "right"),
         ("touch_enabled", "true"),
+        ("tablet_keyboard_enabled", "true"),
         ("debounce_seconds", "1.0"),
         ("startup_wait_seconds", "90"),
         ("blacklist_rotations", ""),
@@ -231,6 +238,221 @@ def set_tablet_lock_process(lock: bool) -> subprocess.CompletedProcess:
     )
 
 
+def gsettings_get_bool(schema: str, key: str) -> tuple[Optional[bool], str]:
+    gsettings = shutil.which("gsettings")
+    if not gsettings:
+        return None, "gsettings is not installed"
+
+    result = run_process([gsettings, "get", schema, key], timeout=5)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"Could not read {schema} {key}"
+        return None, detail
+
+    value = result.stdout.strip().lower()
+    if value in {"true", "false"}:
+        return value == "true", ""
+    return None, f"Unexpected gsettings value for {schema} {key}: {value}"
+
+
+def gsettings_set_bool(schema: str, key: str, value: bool) -> Optional[str]:
+    gsettings = shutil.which("gsettings")
+    if not gsettings:
+        return "gsettings is not installed"
+
+    result = run_process([gsettings, "set", schema, key, "true" if value else "false"], timeout=5)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip() or f"Could not write {schema} {key}"
+    return None
+
+
+def process_running(name: str) -> bool:
+    pgrep = shutil.which("pgrep")
+    if not pgrep:
+        return False
+    return run_process([pgrep, "-x", name], timeout=5).returncode == 0
+
+
+def onboard_keyboard_status() -> Dict[str, object]:
+    auto_show, auto_show_error = gsettings_get_bool(ONBOARD_SCHEMA, ONBOARD_AUTO_SHOW_KEY)
+    accessibility, accessibility_error = gsettings_get_bool(
+        GNOME_INTERFACE_SCHEMA,
+        TOOLKIT_ACCESSIBILITY_KEY,
+    )
+    errors = [error for error in (auto_show_error, accessibility_error) if error]
+    return {
+        "available": shutil.which("onboard") is not None,
+        "running": process_running("onboard"),
+        "auto_show": auto_show,
+        "toolkit_accessibility": accessibility,
+        "restore_pending": ONBOARD_RESTORE_PATH.exists(),
+        "error": "; ".join(errors),
+    }
+
+
+def onboard_keyboard_status_process() -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        ["onboard", "tablet-keyboard-status"],
+        0,
+        json.dumps(onboard_keyboard_status()),
+        "",
+    )
+
+
+def read_onboard_restore_state() -> Dict[str, object]:
+    if not ONBOARD_RESTORE_PATH.exists():
+        return {}
+    try:
+        return json.loads(ONBOARD_RESTORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_onboard_restore_state(state: Dict[str, object]) -> Optional[str]:
+    try:
+        ONBOARD_RESTORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ONBOARD_RESTORE_PATH.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return f"Could not save Onboard restore state: {exc}"
+    return None
+
+
+def remove_onboard_restore_state() -> None:
+    try:
+        ONBOARD_RESTORE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def stop_onboard_process() -> Optional[str]:
+    if not process_running("onboard"):
+        return None
+
+    pkill = shutil.which("pkill")
+    if not pkill:
+        return "pkill is not installed; Onboard was left running"
+
+    result = run_process([pkill, "-x", "onboard"], timeout=5)
+    if result.returncode not in {0, 1}:
+        return (result.stderr or result.stdout).strip() or "Could not stop Onboard"
+    return None
+
+
+def enable_onboard_keyboard_process() -> subprocess.CompletedProcess:
+    onboard = shutil.which("onboard")
+    if not onboard:
+        return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), "Onboard is not installed")
+
+    auto_show, auto_show_error = gsettings_get_bool(ONBOARD_SCHEMA, ONBOARD_AUTO_SHOW_KEY)
+    accessibility, accessibility_error = gsettings_get_bool(
+        GNOME_INTERFACE_SCHEMA,
+        TOOLKIT_ACCESSIBILITY_KEY,
+    )
+    errors = [error for error in (auto_show_error, accessibility_error) if error]
+    if errors:
+        return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), "\n".join(errors))
+
+    previous_state = read_onboard_restore_state()
+    if not previous_state:
+        error = write_onboard_restore_state(
+            {
+                "auto_show_enabled": auto_show,
+                "toolkit_accessibility": accessibility,
+                "onboard_was_running": process_running("onboard"),
+            }
+        )
+        if error:
+            return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), error)
+
+    errors = []
+    for schema, key in (
+        (GNOME_INTERFACE_SCHEMA, TOOLKIT_ACCESSIBILITY_KEY),
+        (ONBOARD_SCHEMA, ONBOARD_AUTO_SHOW_KEY),
+    ):
+        error = gsettings_set_bool(schema, key, True)
+        if error:
+            errors.append(error)
+
+    if errors:
+        restore_onboard_keyboard_process(stop_started=False)
+        return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), "\n".join(errors))
+
+    if not process_running("onboard"):
+        try:
+            subprocess.Popen(
+                [onboard],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            restore_onboard_keyboard_process(stop_started=False)
+            return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), f"Could not start Onboard: {exc}")
+
+    return subprocess.CompletedProcess([onboard], 0, json.dumps(onboard_keyboard_status()), "")
+
+
+def restore_onboard_keyboard_process(stop_started: bool = True) -> subprocess.CompletedProcess:
+    state = read_onboard_restore_state()
+    errors: List[str] = []
+
+    if state:
+        auto_show = state.get("auto_show_enabled")
+        if isinstance(auto_show, bool):
+            error = gsettings_set_bool(ONBOARD_SCHEMA, ONBOARD_AUTO_SHOW_KEY, auto_show)
+            if error:
+                errors.append(error)
+
+        accessibility = state.get("toolkit_accessibility")
+        if isinstance(accessibility, bool):
+            error = gsettings_set_bool(GNOME_INTERFACE_SCHEMA, TOOLKIT_ACCESSIBILITY_KEY, accessibility)
+            if error:
+                errors.append(error)
+
+        if stop_started and state.get("onboard_was_running") is False:
+            error = stop_onboard_process()
+            if error:
+                errors.append(error)
+
+        if not errors:
+            remove_onboard_restore_state()
+
+    return subprocess.CompletedProcess(
+        ["onboard", "tablet-keyboard-restore"],
+        1 if errors else 0,
+        json.dumps(onboard_keyboard_status()),
+        "\n".join(errors),
+    )
+
+
+def set_tablet_mode_process(lock: bool, keyboard_enabled: bool) -> subprocess.CompletedProcess:
+    if lock and keyboard_enabled:
+        keyboard_result = enable_onboard_keyboard_process()
+        if keyboard_result.returncode != 0:
+            return subprocess.CompletedProcess(
+                [],
+                1,
+                json.dumps(tablet_lock_status()),
+                "On-screen keyboard setup failed before locking input:\n"
+                + (keyboard_result.stderr or keyboard_result.stdout).strip(),
+            )
+
+    lock_result = set_tablet_lock_process(lock)
+    if lock_result.returncode != 0:
+        if lock and keyboard_enabled:
+            restore_onboard_keyboard_process(stop_started=True)
+        return lock_result
+
+    if not lock:
+        keyboard_result = restore_onboard_keyboard_process(stop_started=True)
+        if keyboard_result.returncode != 0:
+            detail = (keyboard_result.stderr or keyboard_result.stdout).strip()
+            return subprocess.CompletedProcess(lock_result.args, 1, lock_result.stdout, detail)
+
+    return lock_result
+
+
 def read_config() -> OrderedDict:
     config = OrderedDict(DEFAULT_CONFIG)
     extras = OrderedDict()
@@ -375,6 +597,7 @@ class ControlPanel(Gtk.Application):
         self.sensor_timer_id: Optional[int] = None
         self.tablet_lock_active = False
         self.tablet_lock_partial = False
+        self.onboard_status: Dict[str, object] = {}
 
     def do_activate(self) -> None:
         if self.window is None:
@@ -387,6 +610,8 @@ class ControlPanel(Gtk.Application):
         self.update_sensor_indicator()
 
     def do_shutdown(self) -> None:
+        if not (self.tablet_lock_active or self.tablet_lock_partial):
+            restore_onboard_keyboard_process(stop_started=False)
         if self.sensor_timer_id is not None:
             GLib.source_remove(self.sensor_timer_id)
             self.sensor_timer_id = None
@@ -563,6 +788,16 @@ class ControlPanel(Gtk.Application):
         self.tablet_lock_devices_label.get_style_context().add_class("dim-label")
         box.pack_start(self.tablet_lock_devices_label, False, False, 0)
 
+        self.tablet_keyboard_check = Gtk.CheckButton(label="Open on-screen keyboard when typing")
+        self.tablet_keyboard_check.connect("toggled", self.on_tablet_keyboard_check)
+        box.pack_start(self.tablet_keyboard_check, False, False, 0)
+
+        self.onboard_status_label = Gtk.Label(label="On-screen keyboard: unknown")
+        self.onboard_status_label.set_xalign(0)
+        self.onboard_status_label.set_line_wrap(True)
+        self.onboard_status_label.get_style_context().add_class("dim-label")
+        box.pack_start(self.onboard_status_label, False, False, 0)
+
         self.tablet_lock_button = Gtk.Button.new_with_label("Enable Tablet Input Lock")
         self.tablet_lock_button.set_size_request(-1, 72)
         self.tablet_lock_button.connect("clicked", self.on_tablet_lock_button)
@@ -669,6 +904,7 @@ class ControlPanel(Gtk.Application):
 
         self.run_background(work, done)
         self.refresh_tablet_lock_status()
+        self.refresh_onboard_status()
 
     def load_config_into_widgets(self) -> None:
         self.loading = True
@@ -688,6 +924,7 @@ class ControlPanel(Gtk.Application):
                 check.set_active(rotation in blacklist)
 
             self.auto_switch.set_active(bool_value(self.config.get("enabled", "true")))
+            self.tablet_keyboard_check.set_active(bool_value(self.config.get("tablet_keyboard_enabled", "true")))
         except ValueError:
             pass
         finally:
@@ -765,23 +1002,102 @@ class ControlPanel(Gtk.Application):
             "Unlock Keyboard and Pointer" if should_unlock else "Enable Tablet Input Lock"
         )
         self.tablet_lock_button.set_sensitive(available and (bool(devices) or should_unlock))
+        self.tablet_keyboard_check.set_sensitive(available and shutil.which("onboard") is not None)
+        if not locked and not partial and ONBOARD_RESTORE_PATH.exists():
+            restore_onboard_keyboard_process(stop_started=False)
+            self.refresh_onboard_status()
 
     def on_tablet_lock_button(self, _button: Gtk.Button) -> None:
         lock = not (self.tablet_lock_active or self.tablet_lock_partial)
+        keyboard_enabled = self.tablet_keyboard_check.get_active()
 
         def work() -> subprocess.CompletedProcess:
-            return set_tablet_lock_process(lock)
+            return set_tablet_mode_process(lock, keyboard_enabled)
 
         def done(result: subprocess.CompletedProcess) -> None:
             self.apply_tablet_lock_status_result(result)
+            self.refresh_onboard_status()
             if result.returncode == 0:
                 if lock:
-                    self.set_message("Tablet input lock enabled for this session only.")
+                    if keyboard_enabled:
+                        self.set_message("Tablet input lock enabled. Onboard will open for text fields when detected.")
+                    else:
+                        self.set_message("Tablet input lock enabled for this session only.")
                 else:
                     self.set_message("Keyboard and pointer unlocked.")
             else:
                 detail = (result.stderr or result.stdout).strip()
                 self.set_message(f"Tablet input lock failed.\n{detail}")
+
+        self.run_background(work, done)
+
+    def refresh_onboard_status(self) -> None:
+        def work() -> subprocess.CompletedProcess:
+            return onboard_keyboard_status_process()
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            self.apply_onboard_status_result(result)
+
+        self.run_background(work, done, busy=False)
+
+    def apply_onboard_status_result(self, result: subprocess.CompletedProcess) -> None:
+        try:
+            status = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            status = {"available": False, "running": False, "auto_show": None, "error": "unknown"}
+        self.apply_onboard_status(status)
+
+    def apply_onboard_status(self, status: Dict[str, object]) -> None:
+        self.onboard_status = status
+        available = bool(status.get("available"))
+        running = bool(status.get("running"))
+        auto_show = status.get("auto_show")
+        accessibility = status.get("toolkit_accessibility")
+        error = str(status.get("error", ""))
+
+        if not available:
+            text = "On-screen keyboard: Onboard is not installed"
+        elif error:
+            text = f"On-screen keyboard: status unavailable ({error})"
+        else:
+            running_text = "running" if running else "not running"
+            auto_text = "auto-show on" if auto_show is True else "auto-show off"
+            access_text = "accessibility on" if accessibility is True else "accessibility off"
+            text = f"On-screen keyboard: Onboard {running_text}; {auto_text}; {access_text}"
+
+        self.onboard_status_label.set_text(text)
+
+    def on_tablet_keyboard_check(self, _button: Gtk.CheckButton) -> None:
+        if self.loading:
+            return
+
+        config = read_config()
+        enabled = self.tablet_keyboard_check.get_active()
+        config["tablet_keyboard_enabled"] = "true" if enabled else "false"
+        write_config(config)
+        self.config = config
+
+        if not (self.tablet_lock_active or self.tablet_lock_partial):
+            self.set_message("On-screen keyboard preference saved.")
+            self.refresh_onboard_status()
+            return
+
+        def work() -> subprocess.CompletedProcess:
+            if enabled:
+                return enable_onboard_keyboard_process()
+            return restore_onboard_keyboard_process(stop_started=True)
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            self.apply_onboard_status_result(result)
+            if result.returncode == 0:
+                self.set_message(
+                    "On-screen keyboard enabled for tablet mode."
+                    if enabled
+                    else "On-screen keyboard helper disabled."
+                )
+            else:
+                detail = (result.stderr or result.stdout).strip()
+                self.set_message(f"On-screen keyboard change failed.\n{detail}")
 
         self.run_background(work, done)
 
