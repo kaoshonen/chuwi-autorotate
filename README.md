@@ -14,6 +14,10 @@ This tool uses `monitor-sensor` from `iio-sensor-proxy` for accelerometer orient
 - User service: `~/.config/systemd/user/chuwi-autorotate.service`
 - Log: `~/.local/state/chuwi-autorotate/chuwi-autorotate.log`
 
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0. See `LICENSE`.
+
 ## Install
 
 Install required packages if needed:
