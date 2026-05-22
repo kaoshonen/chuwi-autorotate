@@ -25,7 +25,7 @@ from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.kaoshonen.ChuwiAutorotatePanel"
 APP_NAME = "CHUWI Autorotate"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 REPOSITORY_URL = "https://github.com/kaoshonen/chuwi-autorotate"
 
 CONFIG_DIR = Path.home() / ".config" / "chuwi-autorotate"
@@ -42,8 +42,14 @@ SENSOR_ANGLES = {"normal": 0, "right-up": 90, "bottom-up": 180, "left-up": -90}
 TABLET_LOCK_DEVICE_NAMES = ("AT Translated Set 2 keyboard", "HID 0603:0003 Mouse")
 ONBOARD_SCHEMA = "org.onboard.auto-show"
 ONBOARD_AUTO_SHOW_KEY = "enabled"
+ONBOARD_WINDOW_LANDSCAPE_SCHEMA = "org.onboard.window.landscape"
+ONBOARD_WINDOW_PORTRAIT_SCHEMA = "org.onboard.window.portrait"
 GNOME_INTERFACE_SCHEMA = "org.gnome.desktop.interface"
 TOOLKIT_ACCESSIBILITY_KEY = "toolkit-accessibility"
+ONBOARD_TABLET_LARGE_SIZE = {
+    ONBOARD_WINDOW_LANDSCAPE_SCHEMA: {"width": 900, "height": 280, "dock-width": 900, "dock-height": 280},
+    ONBOARD_WINDOW_PORTRAIT_SCHEMA: {"width": 700, "height": 300, "dock-width": 700, "dock-height": 300},
+}
 DEFAULT_CONFIG = OrderedDict(
     [
         ("enabled", "true"),
@@ -265,6 +271,62 @@ def gsettings_set_bool(schema: str, key: str, value: bool) -> Optional[str]:
     return None
 
 
+def gsettings_get_int(schema: str, key: str) -> tuple[Optional[int], str]:
+    gsettings = shutil.which("gsettings")
+    if not gsettings:
+        return None, "gsettings is not installed"
+
+    result = run_process([gsettings, "get", schema, key], timeout=5)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"Could not read {schema} {key}"
+        return None, detail
+
+    value = result.stdout.strip()
+    try:
+        return int(value), ""
+    except ValueError:
+        return None, f"Unexpected gsettings value for {schema} {key}: {value}"
+
+
+def gsettings_set_int(schema: str, key: str, value: int) -> Optional[str]:
+    gsettings = shutil.which("gsettings")
+    if not gsettings:
+        return "gsettings is not installed"
+
+    result = run_process([gsettings, "set", schema, key, str(value)], timeout=5)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip() or f"Could not write {schema} {key}"
+    return None
+
+
+def read_onboard_window_sizes() -> tuple[Dict[str, Dict[str, int]], List[str]]:
+    sizes: Dict[str, Dict[str, int]] = {}
+    errors: List[str] = []
+    for schema, values in ONBOARD_TABLET_LARGE_SIZE.items():
+        sizes[schema] = {}
+        for key in values:
+            current, error = gsettings_get_int(schema, key)
+            if error:
+                errors.append(error)
+            elif current is not None:
+                sizes[schema][key] = current
+    return sizes, errors
+
+
+def apply_onboard_window_sizes(sizes: Dict[str, object]) -> List[str]:
+    errors: List[str] = []
+    for schema, values in sizes.items():
+        if not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            if not isinstance(value, int):
+                continue
+            error = gsettings_set_int(str(schema), str(key), value)
+            if error:
+                errors.append(error)
+    return errors
+
+
 def process_running(name: str) -> bool:
     pgrep = shutil.which("pgrep")
     if not pgrep:
@@ -278,12 +340,15 @@ def onboard_keyboard_status() -> Dict[str, object]:
         GNOME_INTERFACE_SCHEMA,
         TOOLKIT_ACCESSIBILITY_KEY,
     )
+    window_sizes, size_errors = read_onboard_window_sizes()
     errors = [error for error in (auto_show_error, accessibility_error) if error]
+    errors.extend(size_errors)
     return {
         "available": shutil.which("onboard") is not None,
         "running": process_running("onboard"),
         "auto_show": auto_show,
         "toolkit_accessibility": accessibility,
+        "window_sizes": window_sizes,
         "restore_pending": ONBOARD_RESTORE_PATH.exists(),
         "error": "; ".join(errors),
     }
@@ -353,6 +418,10 @@ def enable_onboard_keyboard_process() -> subprocess.CompletedProcess:
     if errors:
         return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), "\n".join(errors))
 
+    window_sizes, size_errors = read_onboard_window_sizes()
+    if size_errors:
+        return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), "\n".join(size_errors))
+
     previous_state = read_onboard_restore_state()
     if not previous_state:
         error = write_onboard_restore_state(
@@ -360,8 +429,14 @@ def enable_onboard_keyboard_process() -> subprocess.CompletedProcess:
                 "auto_show_enabled": auto_show,
                 "toolkit_accessibility": accessibility,
                 "onboard_was_running": process_running("onboard"),
+                "window_sizes": window_sizes,
             }
         )
+        if error:
+            return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), error)
+    elif "window_sizes" not in previous_state:
+        previous_state["window_sizes"] = window_sizes
+        error = write_onboard_restore_state(previous_state)
         if error:
             return subprocess.CompletedProcess([], 1, json.dumps(onboard_keyboard_status()), error)
 
@@ -373,6 +448,7 @@ def enable_onboard_keyboard_process() -> subprocess.CompletedProcess:
         error = gsettings_set_bool(schema, key, True)
         if error:
             errors.append(error)
+    errors.extend(apply_onboard_window_sizes(ONBOARD_TABLET_LARGE_SIZE))
 
     if errors:
         restore_onboard_keyboard_process(stop_started=False)
@@ -409,6 +485,10 @@ def restore_onboard_keyboard_process(stop_started: bool = True) -> subprocess.Co
             error = gsettings_set_bool(GNOME_INTERFACE_SCHEMA, TOOLKIT_ACCESSIBILITY_KEY, accessibility)
             if error:
                 errors.append(error)
+
+        window_sizes = state.get("window_sizes")
+        if isinstance(window_sizes, dict):
+            errors.extend(apply_onboard_window_sizes(window_sizes))
 
         if stop_started and state.get("onboard_was_running") is False:
             error = stop_onboard_process()
@@ -1053,6 +1133,7 @@ class ControlPanel(Gtk.Application):
         running = bool(status.get("running"))
         auto_show = status.get("auto_show")
         accessibility = status.get("toolkit_accessibility")
+        window_sizes = status.get("window_sizes", {})
         error = str(status.get("error", ""))
 
         if not available:
@@ -1063,7 +1144,12 @@ class ControlPanel(Gtk.Application):
             running_text = "running" if running else "not running"
             auto_text = "auto-show on" if auto_show is True else "auto-show off"
             access_text = "accessibility on" if accessibility is True else "accessibility off"
-            text = f"On-screen keyboard: Onboard {running_text}; {auto_text}; {access_text}"
+            landscape = window_sizes.get(ONBOARD_WINDOW_LANDSCAPE_SCHEMA, {}) if isinstance(window_sizes, dict) else {}
+            if isinstance(landscape, dict) and "width" in landscape and "height" in landscape:
+                size_text = f"landscape {landscape['width']}x{landscape['height']}"
+            else:
+                size_text = "size unknown"
+            text = f"On-screen keyboard: Onboard {running_text}; {auto_text}; {access_text}; {size_text}"
 
         self.onboard_status_label.set_text(text)
 

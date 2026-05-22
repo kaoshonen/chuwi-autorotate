@@ -122,7 +122,7 @@ The tablet input lock disables only the detected internal keyboard and internal 
 
 It does not disable the touchscreen, power button, video bus, or Intel HID buttons. The lock is session-only and is not written to config, so restarting the computer or logging back in returns input to normal.
 
-The `Open on-screen keyboard when typing` option starts Onboard when tablet input lock is enabled and turns on Onboard auto-show for text fields. The panel records the previous Onboard auto-show/accessibility settings and restores them when tablet input lock is disabled. If Onboard was not already running, the panel stops it again on unlock.
+The `Open on-screen keyboard when typing` option starts Onboard when tablet input lock is enabled, turns on Onboard auto-show for text fields, and temporarily applies a large tablet keyboard size. The panel records the previous Onboard auto-show/accessibility/size settings and restores them when tablet input lock is disabled. If Onboard was not already running, the panel stops it again on unlock.
 
 The About dialog says `Made by Kyle Auchterlonie 2026` and links to:
 
