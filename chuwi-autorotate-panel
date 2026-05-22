@@ -25,7 +25,7 @@ from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.kaoshonen.ChuwiAutorotatePanel"
 APP_NAME = "CHUWI Autorotate"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 REPOSITORY_URL = "https://github.com/kaoshonen/chuwi-autorotate"
 
 CONFIG_DIR = Path.home() / ".config" / "chuwi-autorotate"
@@ -39,6 +39,7 @@ ICON_PATH = Path(__file__).resolve().parent / "icons" / "hicolor" / "scalable" /
 
 ROTATIONS = ("normal", "right", "inverted", "left")
 SENSOR_ANGLES = {"normal": 0, "right-up": 90, "bottom-up": 180, "left-up": -90}
+SENSOR_DRAWING_OFFSET_DEGREES = -90
 TABLET_LOCK_DEVICE_NAMES = ("AT Translated Set 2 keyboard", "HID 0603:0003 Mouse")
 ONBOARD_SCHEMA = "org.onboard.auto-show"
 ONBOARD_AUTO_SHOW_KEY = "enabled"
@@ -656,7 +657,8 @@ class SensorDrawing(Gtk.DrawingArea):
 
         context.save()
         context.translate(center_x, center_y)
-        context.rotate(math.radians(SENSOR_ANGLES.get(self.orientation, 0)))
+        drawing_angle = SENSOR_ANGLES.get(self.orientation, 0) + SENSOR_DRAWING_OFFSET_DEGREES
+        context.rotate(math.radians(drawing_angle))
 
         if self.orientation not in SENSOR_ANGLES:
             context.set_source_rgb(0.55, 0.60, 0.65)
