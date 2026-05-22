@@ -25,7 +25,7 @@ from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.kaoshonen.ChuwiAutorotatePanel"
 APP_NAME = "CHUWI Autorotate"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 REPOSITORY_URL = "https://github.com/kaoshonen/chuwi-autorotate"
 
 CONFIG_DIR = Path.home() / ".config" / "chuwi-autorotate"
@@ -92,6 +92,39 @@ def run_command(args: Iterable[str], timeout: float = 30, use_pkexec: bool = Fal
 
 def run_process(command: List[str], timeout: float = 15) -> subprocess.CompletedProcess:
     return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+
+
+def restart_sensor_stack_process() -> subprocess.CompletedProcess:
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return subprocess.CompletedProcess([], 127, "", "systemctl is not installed")
+
+    pkexec = shutil.which("pkexec")
+    if not pkexec:
+        return subprocess.CompletedProcess([], 127, "", "pkexec is not installed")
+
+    system_result = run_process(
+        [pkexec, systemctl, "restart", "iio-sensor-proxy.service"],
+        timeout=180,
+    )
+    if system_result.returncode != 0:
+        detail = (system_result.stderr or system_result.stdout).strip() or "iio-sensor-proxy restart failed"
+        return subprocess.CompletedProcess(system_result.args, system_result.returncode, system_result.stdout, detail)
+
+    user_result = run_process(
+        [systemctl, "--user", "restart", "chuwi-autorotate.service"],
+        timeout=30,
+    )
+    if user_result.returncode != 0:
+        detail = (user_result.stderr or user_result.stdout).strip() or "chuwi-autorotate restart failed"
+        return subprocess.CompletedProcess(user_result.args, user_result.returncode, user_result.stdout, detail)
+
+    return subprocess.CompletedProcess(
+        ["restart-sensor-stack"],
+        0,
+        "Restarted iio-sensor-proxy and chuwi-autorotate.",
+        "",
+    )
 
 
 def parse_status(output: str) -> Dict[str, str]:
@@ -733,6 +766,7 @@ class ControlPanel(Gtk.Application):
 
         outer.pack_start(self.build_expander("Status", self.build_status_section(), True), False, False, 0)
         outer.pack_start(self.build_expander("Controls", self.build_controls_section(), True), False, False, 0)
+        outer.pack_start(self.build_expander("Troubleshooting", self.build_troubleshooting_section(), False), False, False, 0)
         outer.pack_start(self.build_expander("Tablet Mode", self.build_tablet_section(), True), False, False, 0)
         outer.pack_start(self.build_expander("Settings", self.build_settings_section(), False), False, False, 0)
         outer.pack_start(
@@ -845,6 +879,28 @@ class ControlPanel(Gtk.Application):
         buttons.add(doctor_button)
 
         box.pack_start(buttons, False, False, 0)
+        return frame
+
+    def build_troubleshooting_section(self) -> Gtk.Widget:
+        frame = Gtk.Frame()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        frame.add(box)
+
+        restart_button = Gtk.Button.new_with_label("Restart Sensor Stack")
+        restart_button.set_size_request(-1, 48)
+        restart_button.connect("clicked", self.restart_sensor_stack)
+        box.pack_start(restart_button, False, False, 0)
+
+        self.sensor_restart_label = Gtk.Label(label="Restarts iio-sensor-proxy and the autorotate service.")
+        self.sensor_restart_label.set_xalign(0)
+        self.sensor_restart_label.set_line_wrap(True)
+        self.sensor_restart_label.get_style_context().add_class("dim-label")
+        box.pack_start(self.sensor_restart_label, False, False, 0)
+
         return frame
 
     def build_tablet_section(self) -> Gtk.Widget:
@@ -1241,6 +1297,21 @@ class ControlPanel(Gtk.Application):
             else:
                 detail = (result.stderr or result.stdout).strip()
                 self.set_message(f"Command failed: {' '.join(args)}\n{detail}")
+            self.refresh()
+
+        self.run_background(work, done)
+
+    def restart_sensor_stack(self, _button: Gtk.Button) -> None:
+        def work() -> subprocess.CompletedProcess:
+            return restart_sensor_stack_process()
+
+        def done(result: subprocess.CompletedProcess) -> None:
+            if result.returncode == 0:
+                detail = result.stdout.strip()
+                self.set_message("Sensor stack restarted." if not detail else detail)
+            else:
+                detail = (result.stderr or result.stdout).strip()
+                self.set_message(f"Sensor stack restart failed.\n{detail}")
             self.refresh()
 
         self.run_background(work, done)

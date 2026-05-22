@@ -115,9 +115,11 @@ Open the control panel from the Mint menu as `CHUWI Autorotate`, or run:
 chuwi-autorotate-panel
 ```
 
-The panel is an on-demand GTK window. It shows service/display/sensor/login-screen status, includes a live sensor-orientation indicator, toggles the auto-rotation service, resets or calibrates HOME, runs `doctor`, edits safe config values, installs or removes the LightDM login/lock screen rotation hook, and provides a manual tablet input lock.
+The panel is an on-demand GTK window. It shows service/display/sensor/login-screen status, includes a live sensor-orientation indicator, toggles the auto-rotation service, resets or calibrates HOME, runs `doctor`, edits safe config values, installs or removes the LightDM login/lock screen rotation hook, provides a manual tablet input lock, and can restart the sensor stack when rotation stops responding.
 
-The `Status`, `Controls`, `Tablet Mode`, `Settings`, and `Login/Lock Screen` sections are collapsible. The sensor indicator reads the existing state file written by the autorotate service; it does not start a second accelerometer monitor.
+The `Status`, `Controls`, `Troubleshooting`, `Tablet Mode`, `Settings`, and `Login/Lock Screen` sections are collapsible. The sensor indicator reads the existing state file written by the autorotate service; it does not start a second accelerometer monitor.
+
+The `Restart Sensor Stack` troubleshooting button runs `pkexec systemctl restart iio-sensor-proxy.service`, then restarts the user `chuwi-autorotate.service`. Use it when the service is running but the screen stops responding to rotation; it may prompt for administrator authentication.
 
 The tablet input lock disables only the detected internal keyboard and internal pointer through XInput:
 
