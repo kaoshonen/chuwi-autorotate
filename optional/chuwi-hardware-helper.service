@@ -1,0 +1,19 @@
+[Unit]
+Description=CHUWI optional EC lease and recovery helper
+
+[Service]
+Type=notify
+ExecStart=/usr/libexec/chuwi-hardware-helper
+ExecStopPost=/usr/libexec/chuwi-hardware-helper --restore
+StateDirectory=chuwi-autorotate
+StateDirectoryMode=0700
+WatchdogSec=5s
+WatchdogSignal=SIGKILL
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadWritePaths=-/sys/devices/platform/minibook_ec -/sys/class/leds/minibook::kbd_backlight
+RestrictAddressFamilies=AF_UNIX
+UMask=0077

@@ -245,37 +245,9 @@ def tablet_lock_status_process() -> subprocess.CompletedProcess:
 
 
 def set_tablet_lock_process(lock: bool) -> subprocess.CompletedProcess:
-    discovery = discover_tablet_lock_devices()
-    devices = discovery.get("devices", [])
-    missing = discovery.get("missing", [])
-    xinput = str(discovery.get("xinput", ""))
-
-    if not discovery.get("available"):
-        detail = str(discovery.get("error", "xinput is unavailable"))
-        return subprocess.CompletedProcess([], 1, json.dumps(tablet_lock_status()), detail)
-
-    if lock and missing:
-        detail = "Missing expected internal input devices: " + ", ".join(str(name) for name in missing)
-        return subprocess.CompletedProcess([], 1, json.dumps(tablet_lock_status()), detail)
-
-    if not devices:
-        return subprocess.CompletedProcess([], 1, json.dumps(tablet_lock_status()), "No matching input devices found")
-
-    action = "disable" if lock else "enable"
-    failures: List[str] = []
-    for device in devices:
-        result = run_process([xinput, action, str(device["id"])], timeout=5)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip() or f"xinput {action} failed"
-            failures.append(f"{device['name']}: {detail}")
-
-    status = tablet_lock_status()
-    return subprocess.CompletedProcess(
-        [xinput, action],
-        1 if failures else 0,
-        json.dumps(status),
-        "\n".join(failures),
-    )
+    if lock:
+        return subprocess.CompletedProcess([], 1, "", "Use CHUWI Control Center's protected tablet-mode test.")
+    return run_command(["tablet-mode", "off"], timeout=25)
 
 
 def gsettings_get_bool(schema: str, key: str) -> tuple[Optional[bool], str]:
@@ -541,30 +513,8 @@ def restore_onboard_keyboard_process(stop_started: bool = True) -> subprocess.Co
 
 
 def set_tablet_mode_process(lock: bool, keyboard_enabled: bool) -> subprocess.CompletedProcess:
-    if lock and keyboard_enabled:
-        keyboard_result = enable_onboard_keyboard_process()
-        if keyboard_result.returncode != 0:
-            return subprocess.CompletedProcess(
-                [],
-                1,
-                json.dumps(tablet_lock_status()),
-                "On-screen keyboard setup failed before locking input:\n"
-                + (keyboard_result.stderr or keyboard_result.stdout).strip(),
-            )
-
-    lock_result = set_tablet_lock_process(lock)
-    if lock_result.returncode != 0:
-        if lock and keyboard_enabled:
-            restore_onboard_keyboard_process(stop_started=True)
-        return lock_result
-
-    if not lock:
-        keyboard_result = restore_onboard_keyboard_process(stop_started=True)
-        if keyboard_result.returncode != 0:
-            detail = (keyboard_result.stderr or keyboard_result.stdout).strip()
-            return subprocess.CompletedProcess(lock_result.args, 1, lock_result.stdout, detail)
-
-    return lock_result
+    # All legacy entry points use the guardian; tablet mode does not alter the OSK.
+    return set_tablet_lock_process(lock)
 
 
 def read_config() -> OrderedDict:
@@ -725,7 +675,7 @@ class ControlPanel(Gtk.Application):
         self.update_sensor_indicator()
 
     def do_shutdown(self) -> None:
-        if not (self.tablet_lock_active or self.tablet_lock_partial):
+        if not getattr(self, "protected_tablet", False) and not (self.tablet_lock_active or self.tablet_lock_partial):
             restore_onboard_keyboard_process(stop_started=False)
         if self.sensor_timer_id is not None:
             GLib.source_remove(self.sensor_timer_id)
@@ -906,42 +856,17 @@ class ControlPanel(Gtk.Application):
         return frame
 
     def build_tablet_section(self) -> Gtk.Widget:
-        frame = Gtk.Frame()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(12)
-        box.set_margin_bottom(12)
-        box.set_margin_start(12)
-        box.set_margin_end(12)
-        frame.add(box)
-
-        self.tablet_lock_status_label = Gtk.Label(label="Tablet input lock: unknown")
-        self.tablet_lock_status_label.set_xalign(0)
-        self.tablet_lock_status_label.set_line_wrap(True)
-        self.tablet_lock_status_label.set_selectable(True)
-        box.pack_start(self.tablet_lock_status_label, False, False, 0)
-
-        self.tablet_lock_devices_label = Gtk.Label(label="Targets: internal keyboard and pointer")
-        self.tablet_lock_devices_label.set_xalign(0)
-        self.tablet_lock_devices_label.set_line_wrap(True)
-        self.tablet_lock_devices_label.get_style_context().add_class("dim-label")
-        box.pack_start(self.tablet_lock_devices_label, False, False, 0)
-
-        self.tablet_keyboard_check = Gtk.CheckButton(label="Open on-screen keyboard when typing")
-        self.tablet_keyboard_check.connect("toggled", self.on_tablet_keyboard_check)
-        box.pack_start(self.tablet_keyboard_check, False, False, 0)
-
-        self.onboard_status_label = Gtk.Label(label="On-screen keyboard: unknown")
-        self.onboard_status_label.set_xalign(0)
-        self.onboard_status_label.set_line_wrap(True)
-        self.onboard_status_label.get_style_context().add_class("dim-label")
-        box.pack_start(self.onboard_status_label, False, False, 0)
-
-        self.tablet_lock_button = Gtk.Button.new_with_label("Enable Tablet Input Lock")
-        self.tablet_lock_button.set_size_request(-1, 72)
-        self.tablet_lock_button.connect("clicked", self.on_tablet_lock_button)
-        box.pack_start(self.tablet_lock_button, False, False, 0)
-
-        return frame
+        self.protected_tablet = True
+        self.tablet_keyboard_check = Gtk.CheckButton()  # Preserve legacy config loading without OSK side effects.
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        text = Gtk.Label(label="Tablet input locking now lives in CHUWI Control Center, with a touchscreen trial and automatic keyboard recovery.")
+        text.set_xalign(0)
+        text.set_line_wrap(True)
+        content.pack_start(text, False, False, 0)
+        button = Gtk.Button(label="Open protected tablet controls")
+        button.connect("clicked", self.on_tablet_lock_button)
+        content.pack_start(button, False, False, 0)
+        return content
 
     def build_settings_section(self) -> Gtk.Widget:
         frame = Gtk.Frame()
@@ -1079,6 +1004,8 @@ class ControlPanel(Gtk.Application):
         self.greeter_label.set_text(self.status_values.get("LightDM greeter rotation", "unknown"))
 
     def refresh_tablet_lock_status(self) -> None:
+        if getattr(self, "protected_tablet", False):
+            return
         def work() -> subprocess.CompletedProcess:
             return tablet_lock_status_process()
 
@@ -1146,30 +1073,13 @@ class ControlPanel(Gtk.Application):
             self.refresh_onboard_status()
 
     def on_tablet_lock_button(self, _button: Gtk.Button) -> None:
-        lock = not (self.tablet_lock_active or self.tablet_lock_partial)
-        keyboard_enabled = self.tablet_keyboard_check.get_active()
-
-        def work() -> subprocess.CompletedProcess:
-            return set_tablet_mode_process(lock, keyboard_enabled)
-
-        def done(result: subprocess.CompletedProcess) -> None:
-            self.apply_tablet_lock_status_result(result)
-            self.refresh_onboard_status()
-            if result.returncode == 0:
-                if lock:
-                    if keyboard_enabled:
-                        self.set_message("Tablet input lock enabled. Onboard will open for text fields when detected.")
-                    else:
-                        self.set_message("Tablet input lock enabled for this session only.")
-                else:
-                    self.set_message("Keyboard and pointer unlocked.")
-            else:
-                detail = (result.stderr or result.stdout).strip()
-                self.set_message(f"Tablet input lock failed.\n{detail}")
-
-        self.run_background(work, done)
+        panel = Path(__file__).resolve().parent / "chuwi-control-panel"
+        subprocess.Popen([str(panel)], start_new_session=True)
+        self.set_message("Use Tablet mode in CHUWI Control Center; input has not been changed here.")
 
     def refresh_onboard_status(self) -> None:
+        if getattr(self, "protected_tablet", False):
+            return
         def work() -> subprocess.CompletedProcess:
             return onboard_keyboard_status_process()
 

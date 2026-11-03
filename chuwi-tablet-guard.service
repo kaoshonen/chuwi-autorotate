@@ -1,0 +1,16 @@
+[Unit]
+Description=CHUWI tablet input guardian
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/chuwi-tablet-guard
+ExecStopPost=%h/.local/bin/chuwi-tablet-guard --restore
+WatchdogSec=5s
+WatchdogSignal=SIGKILL
+TimeoutStartSec=12s
+TimeoutStopSec=15s
+Restart=no
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%t/chuwi-tablet/session.env

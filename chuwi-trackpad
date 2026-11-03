@@ -1,0 +1,53 @@
+#!/usr/bin/python3
+"""Structured MiniBook X trackpad status, filter changes and guided read-only check."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from chuwi.trackpad import Backend, TrackpadError, strength
+from chuwi.trackpad_session import Channel, Cancelled, guided
+from chuwi.trackpad_recorder import CaptureError
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status", help="Read-only JSON status; no authentication")
+    apply = commands.add_parser("apply", help="Save strength 1–64; run through pkexec")
+    apply.add_argument("strength")
+    restore = commands.add_parser("restore", help="Restore a backup identifier reported by apply")
+    restore.add_argument("backup")
+    commands.add_parser("measure", help="JSON-lines ready/cancel protocol; run through pkexec")
+    args = parser.parse_args(argv)
+    try:
+        if args.command != "status" and os.geteuid() != 0:
+            raise TrackpadError("Authenticate this helper with pkexec for this operation.")
+        backend = Backend()
+        if args.command == "status":
+            result = backend.status()
+        elif args.command == "apply":
+            result = backend.apply(strength(args.strength))
+        elif args.command == "restore":
+            result = backend.restore(args.backup)
+        else:
+            guided(backend, Channel(sys.stdin.fileno(), sys.stdout))
+            return 0
+        print(json.dumps(result, allow_nan=False), flush=True)
+        return 0
+    except Cancelled as exc:
+        print(json.dumps({"type": "cancelled", "message": str(exc)}), flush=True)
+        return 0
+    except (TrackpadError, CaptureError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(json.dumps({"type": "error", "message": str(exc)}), flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (BrokenPipeError, KeyboardInterrupt):
+        sys.exit(130)

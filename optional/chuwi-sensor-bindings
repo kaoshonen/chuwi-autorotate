@@ -1,0 +1,114 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Explicitly enrolled MDA6655 bindings, restored by ExecStopPost after any exit."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+
+STATE = Path('/var/lib/chuwi-sensor-proxy/bindings.json')
+APPROVAL = Path('/etc/chuwi-sensor-proxy/sensors.json')
+RUNTIME = Path('/run/chuwi-sensor-proxy/buses')
+DEVICES = Path('/sys/bus/i2c/devices')
+DRIVER = Path('/sys/bus/i2c/drivers/mxc4005')
+
+
+def save(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, mode='w', delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def trusted(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('Root-owned, non-writable approval or journal required')
+    return json.loads(path.read_text())
+
+
+def sensor(name):
+    if not isinstance(name, str) or not re.fullmatch(r'i2c-MDA6655:[0-9A-Fa-f]{2}', name):
+        raise RuntimeError('Only specifically identified MDA6655 devices are permitted')
+    device = DEVICES / name
+    modalias = (device / 'modalias').read_text()
+    if 'MDA6655' not in modalias and 'MXC6655' not in modalias:
+        raise RuntimeError('Sensor identity changed')
+    return device
+
+
+def restore():
+    RUNTIME.unlink(missing_ok=True)
+    if not STATE.exists():
+        return
+    record = trusted(STATE)
+    if record.get('version') != 1:
+        raise RuntimeError('Unknown sensor recovery journal')
+    for name in record['bound']:
+        device = sensor(name)
+        link = device / 'driver'
+        if link.exists():
+            if link.resolve() != DRIVER.resolve():
+                raise RuntimeError('Another driver owns a recorded sensor; journal retained')
+        else:
+            (DRIVER / 'bind').write_text(name)
+            if link.resolve(strict=True) != DRIVER.resolve():
+                raise RuntimeError('Sensor binding restoration could not be verified')
+    STATE.unlink()
+
+
+def prepare():
+    restore()
+    approval = trusted(APPROVAL)
+    if approval.get('enabled') is not True:
+        raise RuntimeError('Dual sensors have not been individually approved')
+    for key, file in [('vendor','sys_vendor'), ('model','product_name'), ('bios','bios_version')]:
+        if approval.get(key) != (Path('/sys/class/dmi/id') / file).read_text().strip():
+            raise RuntimeError('Sensor approval does not match this firmware and machine')
+    names = approval.get('sensors', [])
+    if len(names) != 2 or len(set(names)) != 2:
+        raise RuntimeError('Enroll exactly two sensors, display first and base second')
+    buses, bound = [], []
+    for name in names:
+        device = sensor(name)
+        parent = device.resolve().parent.name
+        if not re.fullmatch(r'i2c-\d+', parent):
+            raise RuntimeError('Cannot establish sensor adapter ancestry')
+        buses.append(int(parent[4:]))
+        link = device / 'driver'
+        if link.exists():
+            if link.resolve() != DRIVER.resolve():
+                raise RuntimeError('Unexpected sensor driver')
+            bound.append(name)
+    if len(set(buses)) != 2:
+        raise RuntimeError('Expected independent identified sensor adapters')
+    save(STATE, {'version': 1, 'bound': bound})
+    try:
+        for name in bound:
+            (DRIVER / 'unbind').write_text(name)
+            if (sensor(name)/'driver').exists():
+                raise RuntimeError('Sensor remained bound; raw access refused')
+        RUNTIME.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        RUNTIME.write_text(' '.join(map(str, buses))+'\n')
+        RUNTIME.chmod(0o600)
+    except BaseException:
+        restore()
+        raise
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('operation', choices=['prepare','restore'])
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error('This command belongs to the separately approved system service')
+    (prepare if args.operation == 'prepare' else restore)()

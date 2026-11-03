@@ -1,0 +1,12 @@
+[Unit]
+Description=Explicitly approved temporary CHUWI deep sleep trial
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/chuwi-sleep-test
+ExecStopPost=/usr/libexec/chuwi-sleep-test --restore
+StateDirectory=chuwi-autorotate
+StateDirectoryMode=0700
+TimeoutStartSec=11min
+TimeoutStopSec=10s
+UMask=0077

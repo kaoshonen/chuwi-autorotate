@@ -1,0 +1,50 @@
+#!/usr/bin/python3
+"""Runs only as an explicitly approved one-shot service; never changes boot settings."""
+import argparse
+import os
+import signal
+import subprocess
+import sys
+sys.path.insert(0,'/usr/lib/chuwi-autorotate')
+from chuwi.sleep import SleepTrial
+
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--restore',action='store_true')
+args=parser.parse_args()
+if os.geteuid() != 0:
+    parser.error('Root service required')
+trial=SleepTrial()
+if args.restore:
+    trial.restore()
+else:
+    if not os.environ.get('INVOCATION_ID'):
+        parser.error('Use the one-shot system service with independent ExecStopPost recovery')
+    def stop(*_): raise SystemExit('Sleep trial cancelled')
+    signal.signal(signal.SIGTERM,stop)
+    signal.signal(signal.SIGINT,stop)
+    from gi.repository import Gio, GLib
+    bus=Gio.bus_get_sync(Gio.BusType.SYSTEM,None)
+    loop=GLib.MainLoop()
+    progress={'entered':False,'resumed':False}
+    def changed(_c,_s,_p,_i,_n,parameters):
+        if parameters.unpack()[0]:
+            progress['entered']=True
+        elif progress['entered']:
+            progress['resumed']=True
+            loop.quit()
+    bus.signal_subscribe('org.freedesktop.login1','org.freedesktop.login1.Manager','PrepareForSleep',
+        '/org/freedesktop/login1',None,Gio.DBusSignalFlags.NONE,changed)
+    def timeout():
+        loop.quit()
+        return False
+    GLib.timeout_add_seconds(120,timeout)
+    trial.prepare()
+    try:
+        subprocess.run(['systemctl','suspend'],check=True,timeout=10)
+        loop.run()
+        if not progress['resumed']:
+            raise RuntimeError('No complete suspend/resume notification; inspect the journal')
+        print('Suspend/resume notification received; inspect kernel logs for actual sleep success')
+    finally:
+        trial.restore()
+        print('Previous selected sleep mode restored')

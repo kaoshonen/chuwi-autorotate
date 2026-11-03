@@ -1,0 +1,20 @@
+[Unit]
+Description=Optional CHUWI extended sensor proxy
+Conflicts=iio-sensor-proxy.service
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=net.hadess.SensorProxy
+ExecStartPre=/usr/libexec/chuwi-sensor-bindings prepare
+ExecStart=/usr/libexec/chuwi-iio-sensor-proxy --application-managed --lazy
+ExecStopPost=/usr/libexec/chuwi-sensor-bindings restore
+StateDirectory=chuwi-sensor-proxy
+StateDirectoryMode=0700
+RuntimeDirectory=chuwi-sensor-proxy
+RuntimeDirectoryMode=0700
+TimeoutStopSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

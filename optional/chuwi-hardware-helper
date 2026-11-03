@@ -1,0 +1,177 @@
+#!/usr/bin/python3
+"""Optional root D-Bus service. Never installed by the user-level installer."""
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import sys
+
+sys.path.insert(0, "/usr/lib/chuwi-autorotate")
+from chuwi.ec import BUS, PATH, EC, Lease
+from gi.repository import Gio, GLib
+
+XML = f'''<node><interface name="{BUS}">
+<method name="Capabilities"><arg type="s" direction="out"/></method>
+<method name="Authorize"><arg type="s" direction="out"/></method>
+<method name="Acquire"><arg type="s" direction="out"/></method>
+<method name="SetInputs"><arg type="b" direction="in"/><arg type="b" direction="in"/><arg type="s" direction="out"/></method>
+<method name="Renew"><arg type="s" direction="out"/></method>
+<method name="Restore"><arg type="s" direction="out"/></method>
+<method name="SetBacklight"><arg type="u" direction="in"/><arg type="s" direction="out"/></method>
+<method name="SetBacklightTimer"><arg type="b" direction="in"/><arg type="s" direction="out"/></method>
+</interface></node>'''
+JOURNAL = Path("/var/lib/chuwi-autorotate/ec-recovery.json")
+
+
+class Service:
+    def __init__(self):
+        self.ec = EC()
+        self.lease = Lease(self.ec, JOURNAL)
+        self.loop = GLib.MainLoop()
+        self.connection = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.authorized_users = {}
+
+    def call(self, name, path, interface, method, signature, values):
+        return self.connection.call_sync(name, path, interface, method, GLib.Variant(signature, values),
+                                         None, Gio.DBusCallFlags.NONE, 3000, None).unpack()
+
+    def uid(self, sender):
+        return self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixUser", "(s)", (sender,))[0]
+
+    def active(self, sender):
+        pid = self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID", "(s)", (sender,))[0]
+        try:
+            session = self.call("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "GetSessionByPID", "(u)", (pid,))[0]
+        except GLib.Error:
+            user = self.call("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "GetUser", "(u)", (self.uid(sender),))[0]
+            display = self.call("org.freedesktop.login1", user, "org.freedesktop.DBus.Properties", "Get", "(ss)", ("org.freedesktop.login1.User", "Display"))[0]
+            session = display[1]
+        properties = self.call("org.freedesktop.login1", session, "org.freedesktop.DBus.Properties", "GetAll", "(s)", ("org.freedesktop.login1.Session",))[0]
+        if not properties.get("Active") or properties.get("Remote") or properties.get("Type") != "x11" or properties.get("LockedHint"):
+            raise RuntimeError("EC controls require the active local X11 session")
+
+    def authorize(self, sender, invocation, operation):
+        try:
+            self.active(sender)
+            subject = ("system-bus-name", {"name": GLib.Variant("s", sender)})
+            args = GLib.Variant("((sa{sv})sa{ss}us)", (subject, BUS+".control", {}, 1, ""))
+            def completed(connection, result, _):
+                try:
+                    authorized = connection.call_finish(result).unpack()[0][0]
+                    if not authorized:
+                        raise RuntimeError("Administrator authorization was not granted")
+                    self.active(sender)
+                    self.respond(invocation, operation())
+                except Exception as exc:
+                    invocation.return_dbus_error(BUS+".Error", str(exc))
+            self.connection.call("org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority", "org.freedesktop.PolicyKit1.Authority",
+                                 "CheckAuthorization", args, None, Gio.DBusCallFlags.NONE, 60000, None, completed, None)
+        except Exception as exc:
+            invocation.return_dbus_error(BUS+".Error", str(exc))
+
+    def respond(self, invocation, result=None):
+        invocation.return_value(GLib.Variant("(s)", (json.dumps(result or {"ok": True}),)))
+
+    def acquire(self, sender):
+        import time
+        self.active(sender)
+        if self.authorized_users.get(self.uid(sender), 0) < time.monotonic():
+            raise RuntimeError("Authorize EC control in the panel before starting a transaction")
+        states = self.lease.acquire(sender, self.uid(sender))
+        return dict(zip(("keyboard", "touchpad"), states))
+
+    def approve(self, sender):
+        import time
+        self.authorized_users[self.uid(sender)] = time.monotonic()+300
+        return {"authorized_seconds": 300}
+
+    def method(self, connection, sender, path, interface, method, parameters, invocation):
+        try:
+            args = parameters.unpack()
+            if method == "Capabilities":
+                self.respond(invocation, {"writable": self.ec.compatible(), "lease_seconds": 5})
+            elif method == "Acquire":
+                self.respond(invocation, self.acquire(sender))
+            elif method == "Authorize":
+                self.authorize(sender, invocation, lambda: self.approve(sender))
+            elif method in ("SetBacklight", "SetBacklightTimer"):
+                self.authorize(sender, invocation, lambda: self.ec.backlight(**({"brightness": args[0]} if method == "SetBacklight" else {"timer": args[0]})))
+            elif method == "Restore":
+                if self.lease.uid is not None and self.uid(sender) != self.lease.uid:
+                    raise RuntimeError("Recovery belongs to another user")
+                self.lease.restore()
+                self.respond(invocation)
+            elif method == "Renew":
+                self.active(sender)
+                self.lease.renew(sender)
+                self.respond(invocation)
+            elif method == "SetInputs":
+                self.active(sender)
+                self.lease.set(sender, *args)
+                self.respond(invocation)
+            else:
+                raise RuntimeError("Unknown operation")
+        except Exception as exc:
+            invocation.return_dbus_error(BUS+".Error", str(exc))
+
+    def notify(self, text):
+        address = os.environ.get("NOTIFY_SOCKET")
+        if not address:
+            raise RuntimeError("The helper requires its recovery service")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+            channel.sendto(text.encode(), "\0"+address[1:] if address.startswith("@") else address)
+
+    def tick(self):
+        self.lease.tick()
+        self.notify("WATCHDOG=1")
+        return True
+
+    def vanished(self, _c, _s, _p, _i, _n, parameters):
+        name, old, new = parameters.unpack()
+        if name == self.lease.owner and not new:
+            self.lease.restore()
+
+    def session_changed(self, *_):
+        if self.lease.owner:
+            try:
+                self.active(self.lease.owner)
+            except Exception:
+                self.lease.restore()
+
+    def sleep_changed(self, *_):
+        self.lease.restore()
+
+    def stop(self):
+        self.lease.restore()
+        self.loop.quit()
+        return False
+
+    def run(self):
+        self.lease.restore()
+        node = Gio.DBusNodeInfo.new_for_xml(XML)
+        self.connection.register_object(PATH, node.interfaces[0], self.method, None, None)
+        Gio.bus_own_name_on_connection(self.connection, BUS, Gio.BusNameOwnerFlags.NONE, None, None)
+        self.connection.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self.vanished)
+        self.connection.signal_subscribe('org.freedesktop.login1', 'org.freedesktop.login1.Manager', 'PrepareForSleep',
+            '/org/freedesktop/login1', None, Gio.DBusSignalFlags.NONE, self.sleep_changed)
+        self.connection.signal_subscribe('org.freedesktop.login1', 'org.freedesktop.DBus.Properties', 'PropertiesChanged',
+            None, None, Gio.DBusSignalFlags.NONE, self.session_changed)
+        GLib.timeout_add(500, self.tick)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self.stop)
+        self.notify("READY=1\nWATCHDOG=1")
+        self.loop.run()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--restore", action="store_true")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise SystemExit("This optional helper runs only through its root service")
+    if args.restore:
+        Lease(EC(), JOURNAL).restore()
+    else:
+        Service().run()

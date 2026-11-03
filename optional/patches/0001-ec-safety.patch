@@ -1,0 +1,136 @@
+--- a/modules/minibook_ec/minibook_ec_core.c
++++ b/modules/minibook_ec/minibook_ec_core.c
+@@ -10,6 +10,9 @@
+  */
+ 
+ #include <linux/acpi.h>
++#include <linux/dmi.h>
++#include <linux/string.h>
++#include <asm/processor.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -96,10 +99,29 @@
+ 
+ static struct platform_device *minibook_ec_pdev;
+ 
++static const struct dmi_system_id minibook_ec_models[] = {
++        {
++                .ident = "CHUWI MiniBook X DNN20",
++                .matches = {
++                        DMI_EXACT_MATCH(DMI_SYS_VENDOR, "CHUWI Innovation And Technology(ShenZhen)co.,Ltd"),
++                        DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "MiniBook X"),
++                        DMI_MATCH(DMI_BIOS_VERSION, "DNN20"),
++                },
++        },
++        { }
++};
++
++static bool hardware_validated;
++module_param(hardware_validated, bool, 0400);
++MODULE_PARM_DESC(hardware_validated, "Explicit acknowledgement of individual hardware validation");
++
+ static int __init minibook_ec_init(void)
+ {
+ 	int ret;
+ 
++	if (!hardware_validated || !dmi_check_system(minibook_ec_models) ||
++            !strstr(boot_cpu_data.x86_model_id, "N150"))
++		return -ENODEV;
+ 	ret = platform_driver_register(&minibook_ec_driver);
+ 	if (ret)
+ 		return ret;
+--- a/modules/minibook_ec/minibook_ec_sysfs.c
++++ b/modules/minibook_ec/minibook_ec_sysfs.c
+@@ -1,7 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ /*
+- * Sysfs attributes: touchpad toggle, keyboard mode, EC version,
+- * BIOS menu unlock.
++ * Sysfs attributes: touchpad toggle, keyboard mode and EC version.
+  */
+ 
+ #include <linux/acpi.h>
+@@ -110,36 +109,10 @@
+ 
+ static DEVICE_ATTR_RO(ec_version);
+ 
+-static ssize_t bios_unlock_store(struct device *dev,
+-				 struct device_attribute *attr,
+-				 const char *buf, size_t count)
+-{
+-	bool unlock;
+-	int ret;
+-
+-	ret = kstrtobool(buf, &unlock);
+-	if (ret < 0)
+-		return ret;
+-
+-	if (!unlock)
+-		return -EINVAL;
+-
+-	ret = ec_write(EC_REG_UNLOCK, UNLOCK_MAGIC);
+-	if (ret < 0)
+-		return ret;
+-
+-	dev_info(dev,
+-		 "BIOS unlock flag set — reboot into BIOS setup to access hidden menus\n");
+-	return count;
+-}
+-
+-static DEVICE_ATTR_WO(bios_unlock);
+-
+ static struct attribute *minibook_ec_attrs[] = {
+ 	&dev_attr_touchpad_enabled.attr,
+ 	&dev_attr_keyboard_enabled.attr,
+ 	&dev_attr_ec_version.attr,
+-	&dev_attr_bios_unlock.attr,
+ 	NULL,
+ };
+ 
+--- a/modules/minibook_ec/minibook_ec_thermal.c
++++ b/modules/minibook_ec/minibook_ec_thermal.c
+@@ -88,10 +88,18 @@
+ 	ec->soc_tz = thermal_tripless_zone_device_register("minibook_soc",
+ 							   ec, &soc_tz_ops,
+ 							   NULL);
+-	if (IS_ERR(ec->soc_tz))
+-		return PTR_ERR(ec->soc_tz);
++	if (IS_ERR(ec->soc_tz)) {
++                int ret = PTR_ERR(ec->soc_tz);
++                ec->soc_tz = NULL;
++                return ret;
++        }
+ 
+-	thermal_zone_device_enable(ec->soc_tz);
++        int ret = thermal_zone_device_enable(ec->soc_tz);
++        if (ret) {
++                thermal_zone_device_unregister(ec->soc_tz);
++                ec->soc_tz = NULL;
++                return ret;
++        }
+ 	return 0;
+ }
+ 
+@@ -105,10 +113,18 @@
+ 
+ 	ec->charger_tz = thermal_tripless_zone_device_register(
+ 		"minibook_charger", ec, &charger_tz_ops, NULL);
+-	if (IS_ERR(ec->charger_tz))
+-		return PTR_ERR(ec->charger_tz);
++	if (IS_ERR(ec->charger_tz)) {
++                int ret = PTR_ERR(ec->charger_tz);
++                ec->charger_tz = NULL;
++                return ret;
++        }
+ 
+-	thermal_zone_device_enable(ec->charger_tz);
++        int ret = thermal_zone_device_enable(ec->charger_tz);
++        if (ret) {
++                thermal_zone_device_unregister(ec->charger_tz);
++                ec->charger_tz = NULL;
++                return ret;
++        }
+ 	return 0;
+ }
+ 

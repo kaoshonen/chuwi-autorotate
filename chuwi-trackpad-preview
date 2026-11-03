@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+"""Source-only preview. All hardware controls are inert; nothing is installed."""
+import os
+from pathlib import Path
+import runpy
+import sys
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+from chuwi.trackpad_preview import PreviewClient
+from chuwi.trackpad_ui import TrackpadPage
+module = runpy.run_path(str(ROOT / "chuwi-control-panel"), run_name="trackpad_preview_panel")
+Gtk, Gdk, GLib = module["Gtk"], module["Gdk"], module["GLib"]
+
+
+class Preview(module["ControlCenter"]):
+    def __init__(self):
+        super().__init__()
+        self.set_application_id("io.github.kaoshonen.ChuwiTrackpadPreview.p" + str(os.getpid()))
+
+    def build_trackpad(self):
+        self.trackpad_page = TrackpadPage(self, PreviewClient())
+        return self.trackpad_page.widget
+
+    def do_activate(self):
+        if self.window is None:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(module["CSS"])
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.build_window()
+            self.window.set_title("Trackpad preview")
+            self.notice.set_text("SOURCE PREVIEW · Simulated trackpad · Hardware actions disabled")
+            for page in self.stack.get_children():
+                if page is not self.trackpad_page.widget:
+                    page.set_sensitive(False)
+            # Select the actual sidebar button so its highlight follows the preview page.
+            sidebar = self.window.get_child().get_children()[0]
+            buttons = [w for w in sidebar.get_children() if isinstance(w, Gtk.RadioButton)]
+            buttons[1].set_active(True)
+            self.trackpad_page.refresh()
+            self.message.set_text("Isolated preview · The installed control center is unchanged")
+        self.window.show_all()
+        self.stack.set_visible_child_name("trackpad")
+        self.notice.show()
+        self.header_unlock.show()
+        self.window.present()
+
+    def refresh(self):
+        if hasattr(self, "trackpad_page"):
+            self.trackpad_page.refresh()
+        return False
+
+    def run_action(self, *_):
+        pass
+
+    def enable_tablet(self):
+        pass
+
+    def unlock_tablet(self):
+        if self.window:
+            self.message.set_text("Preview: Unlock remains responsive. No input state was changed.")
+
+    def ec_control(self, *_):
+        pass
+
+    def set_automatic(self, *_):
+        pass
+
+    def toggle_screen_keyboard(self, *_):
+        pass
+
+    def close_panel(self, *_):
+        self.trackpad_page.close()
+        self.quit()
+        return True
+
+
+if __name__ == "__main__":
+    sys.exit(Preview().run(sys.argv))

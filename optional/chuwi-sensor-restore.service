@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore interrupted optional CHUWI sensor bindings
+Before=iio-sensor-proxy.service chuwi-iio-sensor-proxy.service
+ConditionPathExists=/var/lib/chuwi-sensor-proxy/bindings.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/chuwi-sensor-bindings restore
+
+[Install]
+WantedBy=multi-user.target

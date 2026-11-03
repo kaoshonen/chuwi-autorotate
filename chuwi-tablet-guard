@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""On-demand user D-Bus tablet guardian; systemd owns independent recovery."""
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import socket
+import sys
+import time
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+from chuwi_tablet import BUS, OBJECT, SERVICE, RecoveryStore, TabletError, TabletPolicy, XInputBackend, capture
+
+XML = f"""<node><interface name="{BUS}">
+<method name="BeginTest"><arg type="s" direction="out"/></method>
+<method name="BeginAutomatic"><arg type="s" direction="out"/></method>
+<method name="Release"><arg type="s" direction="out"/></method>
+<method name="Confirm"><arg type="s" direction="out"/></method>
+<method name="Renew"><arg type="s" direction="out"/></method>
+<method name="Unlock"><arg type="s" direction="out"/></method>
+<method name="Status"><arg type="s" direction="out"/></method>
+<signal name="StateChanged"><arg type="s"/></signal>
+</interface></node>"""
+SCREENSAVER = "org.cinnamon.ScreenSaver"
+SCREENSAVER_PATH = "/org/cinnamon/ScreenSaver"
+
+
+def notify(message):
+    address = os.environ.get("NOTIFY_SOCKET", "")
+    if not address:
+        raise TabletError("Recovery must run under its systemd watchdog")
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+        channel.connect(address)
+        channel.sendall(message.encode())
+
+
+class Guardian:
+    def __init__(self):
+        self.loop = GLib.MainLoop()
+        self.policy = TabletPolicy(XInputBackend(), RecoveryStore())
+        self.connection = None
+        self.system = None
+        self.armed = False
+        self.sleeping = False
+        self.last_status = None
+        self.next_screen_check = 0
+        self.manual = True
+        self.session_state = True
+        self.keyboard_scoped = False
+        self.locker_name, self.locker_path = SCREENSAVER, SCREENSAVER_PATH
+        self.name_id = Gio.bus_own_name(Gio.BusType.SESSION, BUS, Gio.BusNameOwnerFlags.NONE,
+                                       self.bus_acquired, self.name_acquired, self.name_lost)
+
+    def bus_acquired(self, connection, _name):
+        self.connection = connection
+        node = Gio.DBusNodeInfo.new_for_xml(XML)
+        connection.register_object(OBJECT, node.interfaces[0], self.method, None, None)
+        connection.signal_subscribe("org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                                    "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self.name_changed)
+        from chuwi.profiles import identify, LOCKERS
+        for name, path in LOCKERS.get(identify()["desktop"], []):
+            try:
+                connection.call_sync(name, path, name, "GetActive", None, GLib.VariantType.new("(b)"),
+                                     Gio.DBusCallFlags.NO_AUTO_START, 1000, None)
+                self.locker_name, self.locker_path = name, path
+                break
+            except GLib.Error:
+                continue
+        connection.signal_subscribe(self.locker_name, self.locker_name, "ActiveChanged", self.locker_path,
+                                    None, Gio.DBusSignalFlags.NONE, self.screen_changed)
+        connection.connect("closed", lambda *_: self.stop("Session bus closed"))
+
+    def screen_locked(self):
+        name, path = getattr(self, "locker_name", SCREENSAVER), getattr(self, "locker_path", SCREENSAVER_PATH)
+        result = self.connection.call_sync(name, path, name, "GetActive", None,
+                                          GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 1500, None)
+        return result.unpack()[0]
+
+    def name_acquired(self, _connection, _name):
+        try:
+            if os.environ.get("XDG_SESSION_TYPE") != "x11":
+                raise TabletError("The guardian requires an X11 desktop")
+            if int(os.environ.get("WATCHDOG_USEC", "0")) != 5_000_000:
+                raise TabletError("The five-second systemd watchdog is unavailable")
+            if int(os.environ.get("WATCHDOG_PID", str(os.getpid()))) != os.getpid():
+                raise TabletError("The watchdog belongs to another process")
+            unit = capture(["systemctl", "--user", "show", SERVICE, "--property=ExecStopPost,WatchdogUSec"])
+            executable = str(Path(__file__).resolve())
+            if executable not in unit or "--restore" not in unit or "WatchdogUSec=5s" not in unit:
+                raise TabletError("Independent input restoration is not installed")
+            self.policy.unlock("Tablet mode off")  # Recover any interrupted previous instance first.
+            self.screen_locked()  # Refuse operation without a functioning screen-lock monitor.
+            self.system = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            result = self.system.call_sync("org.freedesktop.login1", "/org/freedesktop/login1",
+                                          "org.freedesktop.DBus.Properties", "Get",
+                                          GLib.Variant("(ss)", ("org.freedesktop.login1.Manager", "PreparingForSleep")),
+                                          GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 1500, None)
+            self.sleeping = bool(result.unpack()[0])
+            self.system.signal_subscribe("org.freedesktop.login1", "org.freedesktop.login1.Manager", "PrepareForSleep",
+                                         "/org/freedesktop/login1", None, Gio.DBusSignalFlags.NONE, self.sleep_changed)
+            self.system.connect("closed", lambda *_: self.stop("Sleep monitor disconnected"))
+            notify("READY=1\nWATCHDOG=1")
+            self.armed = True
+            GLib.timeout_add(500, self.tick)
+            self.emit()
+        except Exception as exc:
+            print(f"Tablet guardian unavailable: {exc}", file=sys.stderr, flush=True)
+            self.loop.quit()
+
+    def name_lost(self, _connection, _name):
+        self.stop("Tablet guardian connection closed")
+
+    def method(self, connection, sender, _path, _interface, method, _parameters, invocation):
+        try:
+            if method in ("BeginTest", "BeginAutomatic") and getattr(self, "session_state", False) and self.policy.phase == "off":
+                import runpy
+                from chuwi.ec import select_backend
+                engine = runpy.run_path(str(Path(__file__).resolve().parent / "chuwi-autorotate"))
+                backend = select_backend(engine["read_config"](create=False))
+                self.policy.backend = backend
+                self.policy.store.backend_kind = backend.kind
+            if method == "Status":
+                result = self.policy.status()
+            elif method == "BeginTest":
+                from chuwi.session import rearm
+                if getattr(self, "session_state", False):
+                    rearm()
+                self.manual = True
+                result = self.policy.begin(sender, self.armed, self.sleeping or self.screen_locked())
+            elif method == "BeginAutomatic":
+                from chuwi.session import read, inhibited
+                if inhibited() or not read("controller").get("automatic_input_request"):
+                    raise TabletError("Automatic input switching is not currently requested")
+                self.manual = False
+                result = self.policy.begin(sender, self.armed, self.sleeping or self.screen_locked())
+            elif method == "Confirm":
+                result = self.policy.confirm(sender)
+            elif method == "Renew":
+                result = self.policy.renew(sender)
+            elif method == "Unlock":
+                from chuwi.session import inhibit
+                if getattr(self, "session_state", False):
+                    inhibit()
+                result = self.policy.unlock()
+            elif method == "Release":
+                self.policy.check_owner(sender)
+                result = self.policy.unlock("Laptop mode; original input restored")
+            else:
+                raise TabletError("Unknown tablet command")
+            invocation.return_value(GLib.Variant("(s)", (json.dumps(result),)))
+        except Exception as exc:
+            invocation.return_dbus_error(BUS + ".Error", str(exc))
+        self.emit()
+
+    def sync_keyboard(self):
+        from chuwi.osk import KeyboardPreferences
+        active = self.policy.phase in ('trial', 'locked')
+        if active and not self.keyboard_scoped:
+            import runpy
+            engine = runpy.run_path(str(Path(__file__).resolve().parent / 'chuwi-autorotate'))
+            if engine['read_config'](create=False).get('tablet_osk') == 'automatic':
+                from chuwi.profiles import identify
+                KeyboardPreferences().enable(identify()['desktop'])
+                self.keyboard_scoped = True
+        elif not active:
+            KeyboardPreferences().restore()
+            self.keyboard_scoped = False
+
+    def emit(self):
+        if getattr(self, "session_state", False):
+            try:
+                self.sync_keyboard()
+            except Exception as exc:
+                print(f'Screen keyboard preference: {exc}', file=sys.stderr)
+            from chuwi.session import write
+            write("tablet", {**self.policy.status(), "manual": self.manual})
+        status = json.dumps(self.policy.status(), sort_keys=True)
+        if self.connection and status != self.last_status:
+            self.connection.emit_signal(None, OBJECT, BUS, "StateChanged", GLib.Variant("(s)", (status,)))
+            self.last_status = status
+
+    def tick(self):
+        try:
+            previous = self.policy.phase
+            self.policy.tick()
+            if previous in ('trial', 'locked') and self.policy.phase == 'off' and getattr(self, 'session_state', False):
+                from chuwi.session import inhibit
+                inhibit()
+            if getattr(self, "manual", True) is False and self.policy.phase in ("trial", "locked"):
+                from chuwi.session import read
+                if not read("controller").get("automatic_input_request"):
+                    self.policy.unlock("Laptop mode or sensor unavailable; original input restored")
+            if self.policy.phase in ("trial", "locked") and time.monotonic() >= self.next_screen_check:
+                self.next_screen_check = time.monotonic()+2
+                # GetActive keeps Cinnamon's on-demand monitor alive without locking the screen.
+                if self.screen_locked():
+                    self.restore("Screen locked; keyboard and touchpad restored")
+        except TabletError as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+        except Exception:
+            return self.stop("Screen-lock monitoring failed; input restored")
+        self.emit()
+        notify("WATCHDOG=1")
+        return True
+
+    def screen_changed(self, _connection, _sender, _path, _interface, _signal, parameters):
+        if parameters.unpack()[0]:
+            self.restore("Screen locked; keyboard and touchpad restored")
+
+    def sleep_changed(self, _connection, _sender, _path, _interface, _signal, parameters):
+        self.sleeping = bool(parameters.unpack()[0])
+        self.restore("Sleep state changed; keyboard and touchpad restored")
+
+    def name_changed(self, _connection, _sender, _path, _interface, _signal, parameters):
+        name, old_owner, new_owner = parameters.unpack()
+        try:
+            if name == getattr(self, "locker_name", SCREENSAVER) and old_owner and old_owner != new_owner:
+                self.stop("Screen-lock monitor disconnected")
+            elif not new_owner:
+                if name == self.policy.owner and getattr(self, 'session_state', False):
+                    from chuwi.session import inhibit
+                    inhibit()
+                self.policy.owner_lost(name)
+        except TabletError as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+        self.emit()
+
+    def restore(self, reason):
+        if getattr(self, "session_state", False):
+            from chuwi.session import inhibit
+            inhibit()
+        try:
+            self.policy.unlock(reason)
+        except TabletError as exc:
+            print(str(exc), file=sys.stderr, flush=True)
+        self.emit()
+
+    def stop(self, reason):
+        self.armed = False
+        self.restore(reason)
+        self.loop.quit()
+        return False
+
+    def run(self):
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, self.stop, "Guardian stopped; input restored")
+        self.loop.run()
+        self.restore("Guardian stopped; input restored")
+        Gio.bus_unown_name(self.name_id)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--restore", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.restore:
+            from chuwi.session import inhibit
+            inhibit()
+            RecoveryStore().restore(XInputBackend())
+            from chuwi.osk import KeyboardPreferences
+            KeyboardPreferences().restore()
+        elif args.status:
+            connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            exists = connection.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                          "NameHasOwner", GLib.Variant("(s)", (BUS,)), None,
+                                          Gio.DBusCallFlags.NONE, 1500, None).unpack()[0]
+            if exists:
+                status = connection.call_sync(BUS, OBJECT, BUS, "Status", None, None,
+                                              Gio.DBusCallFlags.NO_AUTO_START, 2000, None).unpack()[0]
+            else:
+                pending = RecoveryStore().path.exists()
+                status = json.dumps({"phase": "error" if pending else "off",
+                                     "reason": "Recovery pending; run tablet-mode off" if pending else "Tablet mode off"})
+            print(status)
+        else:
+            Guardian().run()
+        return 0
+    except Exception as exc:
+        print(f"Tablet recovery: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

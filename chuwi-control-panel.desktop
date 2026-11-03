@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CHUWI Control Center
+Comment=Display rotation, trackpad filtering and device controls for the MiniBook X
+Exec=chuwi-control-panel
+Icon=chuwi-autorotate-panel
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=Chuwi;MiniBook;Rotation;Touchscreen;Tablet;Trackpad;Touchpad;Jitter;

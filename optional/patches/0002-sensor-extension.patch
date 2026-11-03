@@ -1,0 +1,541 @@
+--- a/iio-sensor-proxy/src/chuwi-extension.c
++++ b/iio-sensor-proxy/src/chuwi-extension.c
+@@ -0,0 +1,129 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "chuwi-extension.h"
++#include <math.h>
++#include <string.h>
++
++#define INTERFACE "io.github.kaoshonen.ChuwiSensor1"
++#define PATH "/net/hadess/SensorProxy"
++
++gboolean chuwi_application_managed = FALSE;
++static GDBusConnection *bus;
++static GVariant *snapshot;
++static gint64 published;
++static gint previous_mode = -2;
++static gboolean previous_valid;
++static double previous_gravity[3];
++static char *previous_orientation;
++
++GVariant *
++chuwi_snapshot (void)
++{
++        if (!snapshot) {
++                GVariantBuilder b;
++                g_variant_builder_init (&b, G_VARIANT_TYPE_VARDICT);
++                g_variant_builder_add (&b, "{sv}", "version", g_variant_new_uint32 (1));
++                g_variant_builder_add (&b, "{sv}", "valid", g_variant_new_boolean (FALSE));
++                snapshot = g_variant_ref_sink (g_variant_builder_end (&b));
++        }
++        return g_variant_ref (snapshot);
++}
++
++static void
++changed (void)
++{
++        GVariantBuilder b;
++        if (!bus)
++                return;
++        g_variant_builder_init (&b, G_VARIANT_TYPE_VARDICT);
++        g_variant_builder_add (&b, "{sv}", "Snapshot", snapshot);
++        g_dbus_connection_emit_signal (bus, NULL, PATH, "org.freedesktop.DBus.Properties",
++                "PropertiesChanged", g_variant_new ("(sa{sv}as)", INTERFACE, &b, NULL), NULL);
++}
++
++void
++chuwi_invalidate (void)
++{
++        if (!previous_valid)
++                return;
++        previous_valid = FALSE;
++        previous_mode = -2;
++        g_clear_pointer (&snapshot, g_variant_unref);
++        g_variant_unref (chuwi_snapshot ());
++        changed ();
++}
++
++void
++chuwi_publish (gint mode, double hinge, gboolean hinge_valid,
++               const double gravity[3], const char *orientation, gint panel_deg)
++{
++        GVariantBuilder b;
++        gint64 now = g_get_monotonic_time ();
++        gboolean moving = g_strcmp0 (orientation, previous_orientation) != 0;
++        gboolean valid = TRUE;
++        const char *posture = "unknown";
++        const char *owner = "upstream";
++        for (gint i = 0; i < 3; i++) {
++                moving |= fabs (gravity[i] - previous_gravity[i]) > 0.01;
++                valid &= isfinite (gravity[i]);
++        }
++        hinge_valid &= isfinite (hinge) && hinge >= 0 && hinge <= 360.5;
++        if (!hinge_valid)
++                mode = -1;
++        if (mode == previous_mode && valid == previous_valid &&
++            now - published < (moving ? 200000 : 1000000))
++                return;
++        if (mode == 0)
++                posture = "laptop";
++        else if (mode == 1)
++                posture = "tablet";
++        if (chuwi_application_managed)
++                owner = "application";
++        g_variant_builder_init (&b, G_VARIANT_TYPE_VARDICT);
++        g_variant_builder_add (&b, "{sv}", "version", g_variant_new_uint32 (1));
++        g_variant_builder_add (&b, "{sv}", "valid", g_variant_new_boolean (valid));
++        g_variant_builder_add (&b, "{sv}", "sample_monotonic_us", g_variant_new_int64 (now));
++        g_variant_builder_add (&b, "{sv}", "mode", g_variant_new_string (posture));
++        g_variant_builder_add (&b, "{sv}", "hinge_valid", g_variant_new_boolean (hinge_valid));
++        g_variant_builder_add (&b, "{sv}", "hinge_degrees", g_variant_new_double (hinge));
++        g_variant_builder_add (&b, "{sv}", "display_gravity", g_variant_new_fixed_array (G_VARIANT_TYPE_DOUBLE, gravity, 3, sizeof (double)));
++        g_variant_builder_add (&b, "{sv}", "orientation", g_variant_new_string (orientation));
++        g_variant_builder_add (&b, "{sv}", "frame", g_variant_new_string ("mxc6655-display-v1"));
++        g_variant_builder_add (&b, "{sv}", "panel_compensation_degrees", g_variant_new_int32 (panel_deg));
++        g_variant_builder_add (&b, "{sv}", "input_owner", g_variant_new_string (owner));
++        g_clear_pointer (&snapshot, g_variant_unref);
++        snapshot = g_variant_ref_sink (g_variant_builder_end (&b));
++        previous_mode = mode;
++        previous_valid = valid;
++        published = now;
++        memcpy (previous_gravity, gravity, sizeof (previous_gravity));
++        g_free (previous_orientation);
++        previous_orientation = g_strdup (orientation);
++        changed ();
++}
++
++static GVariant *
++get_property (GDBusConnection *c, const gchar *s, const gchar *p,
++              const gchar *i, const gchar *property, GError **error, gpointer data)
++{
++        return chuwi_snapshot ();
++}
++
++static void
++sleep_changed (GDBusConnection *c, const gchar *s, const gchar *p,
++               const gchar *i, const gchar *n, GVariant *parameters, gpointer data)
++{
++        chuwi_invalidate ();
++}
++
++void
++chuwi_export (GDBusConnection *connection)
++{
++        static const GDBusInterfaceVTable vtable = { .get_property = get_property };
++        GDBusNodeInfo *info = g_dbus_node_info_new_for_xml (
++                "<node><interface name='" INTERFACE "'><property name='Snapshot' type='a{sv}' access='read'/></interface></node>", NULL);
++        bus = g_object_ref (connection);
++        g_dbus_connection_register_object (bus, PATH, info->interfaces[0], &vtable, NULL, NULL, NULL);
++        g_dbus_node_info_unref (info);
++        g_dbus_connection_signal_subscribe (bus, "org.freedesktop.login1", "org.freedesktop.login1.Manager",
++                "PrepareForSleep", "/org/freedesktop/login1", NULL, G_DBUS_SIGNAL_FLAGS_NONE, sleep_changed, NULL, NULL);
++}
+--- a/iio-sensor-proxy/src/chuwi-extension.h
++++ b/iio-sensor-proxy/src/chuwi-extension.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#pragma once
++#include <gio/gio.h>
++extern gboolean chuwi_application_managed;
++void chuwi_export (GDBusConnection *connection);
++void chuwi_publish (gint mode, double hinge, gboolean hinge_valid,
++                    const double gravity[3], const char *orientation, gint panel_deg);
++void chuwi_invalidate (void);
++GVariant *chuwi_snapshot (void);
+--- a/iio-sensor-proxy/src/drv-mxc6655-accel.c
++++ b/iio-sensor-proxy/src/drv-mxc6655-accel.c
+@@ -7,6 +7,10 @@
+  */
+ 
+ #include "drivers.h"
++#include "chuwi-extension.h"
++#include <time.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include <fcntl.h>
+ #include <unistd.h>
+@@ -162,6 +166,9 @@
+ 
+ 	/* Degrees of static panel rotation to compensate for */
+ 	gint               panel_deg;
++	gint               physical_orient;
++	double             last_boot_time;
++	gint               read_failures;
+ } DrvData;
+ 
+ /* Rotation the compositor already applies for a given DRM panel orientation. */
+@@ -337,64 +344,27 @@
+ static gint
+ find_accels (gint fds[2])
+ {
+-	gint found = 0;
+-	GUdevClient *client;
+-	GList *list, *l;
+-	const gchar *subsystems[] = { "i2c", NULL };
+-
+-	client = g_udev_client_new (subsystems);
+-	list = g_udev_client_query_by_subsystem (client, "i2c");
+-
+-	for (l = list; l != NULL && found < 2; l = l->next) {
+-		GUdevDevice *dev = l->data;
+-		const gchar *name = g_udev_device_get_name (dev);
+-		const gchar *acpi_path;
+-		gint bus, fd;
+-
+-		acpi_path = g_udev_device_get_sysfs_attr (dev, "firmware_node/path");
+-		if (acpi_path == NULL || strstr (acpi_path, ".I2C") == NULL)
+-			continue;
+-
+-		bus = atoi (name + 4);
+-		fd = probe_bus (bus);
+-		if (fd >= 0) {
+-			g_debug ("MXC6655 found on %s (%s)", name, acpi_path);
+-			fds[found++] = fd;
+-		}
+-	}
+-
+-	g_list_free_full (list, g_object_unref);
+-	g_object_unref (client);
+-	return found;
++        g_autofree gchar *text = NULL;
++        gint buses[2];
++        gint found = 0;
++        if (!g_file_get_contents ("/run/chuwi-sensor-proxy/buses", &text, NULL, NULL))
++                return 0;
++        if (sscanf (text, "%d %d", &buses[0], &buses[1]) != 2 ||
++            buses[0] < 0 || buses[1] < 0 || buses[0] == buses[1])
++                return 0;
++        for (gint i = 0; i < 2; i++) {
++                gint fd = probe_bus (buses[i]);
++                if (fd < 0)
++                        break;
++                fds[found++] = fd;
++        }
++        return found;
+ }
+ 
+ static void
+ try_unbind (void)
+ {
+-	static const char *paths[] = {
+-		"/sys/bus/i2c/drivers/" I2C_UNBIND_DRIVER "/unbind",
+-		"/sys/bus/acpi/drivers/" I2C_UNBIND_DRIVER "/unbind",
+-	};
+-
+-	for (gint i = 0; i < 2; i++) {
+-		gint fd = open (paths[i], O_WRONLY | O_CLOEXEC);
+-		if (fd < 0)
+-			continue;
+-
+-		/* Try several possible indices in case they are enumerated differently */
+-		for (gint idx = 0; idx < 4; idx++) {
+-			g_autofree gchar *name = NULL;
+-			if (i == 0) /* I2C driver unbind */
+-				name = g_strdup_printf ("i2c-" ACPI_MATCH_ID ":%02d", idx);
+-			else /* ACPI driver unbind */
+-				name = g_strdup_printf (ACPI_MATCH_ID ":%02d", idx);
+-
+-			if (write (fd, name, strlen (name)) > 0)
+-				g_debug ("Unbound %s via %s", name, paths[i]);
+-		}
+-		close (fd);
+-	}
+-	usleep (200000);
++        /* The separately journaled binding guard owns all binding changes. */
+ }
+ 
+ static gint
+@@ -1158,7 +1128,11 @@
+ 	try_unbind ();
+ 	if (find_accels (drv_data->i2c_fds) < 2) {
+ 		g_warning ("Failed to re-open MXC6655 accelerometers");
+-		drv_data->i2c_fds[0] = drv_data->i2c_fds[1] = -1;
++                for (gint i = 0; i < 2; i++) {
++                        if (drv_data->i2c_fds[i] >= 0)
++                                close (drv_data->i2c_fds[i]);
++                        drv_data->i2c_fds[i] = -1;
++                }
+ 	}
+ }
+ 
+@@ -1176,6 +1150,7 @@
+ 	if (new_orient < 0)
+ 		return;
+ 
++	drv_data->physical_orient = new_orient;
+ 	if (drv_data->mode != 1)
+ 		new_orient = MXC_ORIENT_RIGHT;
+ 
+@@ -1230,7 +1205,8 @@
+ 
+ 	drv_data->mode = mode;
+ 	g_debug ("%s mode (angle=%.1f)", mode ? "Tablet" : "Laptop", angle);
+-	call_ltsm (mode, &drv_data->ltsm_warned);
++	if (!chuwi_application_managed)
++		call_ltsm (mode, &drv_data->ltsm_warned);
+ 	if (drv_data->uinput_fd >= 0)
+ 		emit_tablet_mode (drv_data->uinput_fd, mode);
+ 
+@@ -1262,6 +1238,17 @@
+ 	}
+ }
+ 
++static void
++publish_snapshot (DrvData *data, const Vec3 *a1, float angle, gboolean valid)
++{
++        static const char *orientations[] = { "normal", "left-up", "bottom-up", "right-up" };
++        double gravity[3] = { a1->x, a1->y, a1->z };
++        const char *orientation = "undefined";
++        if (data->physical_orient >= 0 && data->physical_orient < 4)
++                orientation = orientations[data->physical_orient];
++        chuwi_publish (data->mode, angle, valid, gravity, orientation, data->panel_deg);
++}
++
+ static gboolean
+ poll_sensors (gpointer user_data)
+ {
+@@ -1269,13 +1256,31 @@
+ 	DrvData *drv_data = (DrvData *) sensor_device->priv;
+ 	Vec3 raw1, raw2, a1, a2;
+ 	float angle;
++        struct timespec ts;
++        clock_gettime (CLOCK_BOOTTIME, &ts);
++        double boot = ts.tv_sec + ts.tv_nsec / 1e9;
++        if (boot - drv_data->last_boot_time > 1.0) {
++                drv_data->mode = -1;
++                drv_data->t_count = drv_data->l_count = 0;
++                drv_data->physical_orient = -1;
++                memset (&drv_data->orient, 0, sizeof (drv_data->orient));
++        }
++        drv_data->last_boot_time = boot;
+ 
+ 	if (read_accel (drv_data->i2c_fds[0], &raw1) < 0 ||
+ 	    read_accel (drv_data->i2c_fds[1], &raw2) < 0) {
++		chuwi_invalidate ();
++                drv_data->mode = -1;
++                drv_data->t_count = drv_data->l_count = drv_data->n_count = 0;
++                if (chuwi_application_managed && ++drv_data->read_failures >= 3) {
++                        g_warning ("Repeated sensor failure; exiting for independent binding restoration");
++                        exit (EXIT_FAILURE);
++                }
+ 		recover_i2c (drv_data);
+ 		return G_SOURCE_CONTINUE;
+ 	}
+ 
++	drv_data->read_failures = 0;
+ 	a1 = calibrate (&raw1, drv_data->cal1);
+ 	a2 = calibrate (&raw2, drv_data->cal2);
+ 
+@@ -1287,13 +1292,18 @@
+ 
+ 	/* Gate on the X-Z plane that compute_hinge_angle projects onto, not Y:
+ 	 * near full fold gravity leaves Y, and those are the large-angle samples. */
+-	if (sqrtf (a1.x * a1.x + a1.z * a1.z) < GRAVITY_MIN &&
+-	    sqrtf (a2.x * a2.x + a2.z * a2.z) < GRAVITY_MIN)
+-		return G_SOURCE_CONTINUE;
++	if (sqrtf (a1.x * a1.x + a1.z * a1.z) < GRAVITY_MIN ||
++	    sqrtf (a2.x * a2.x + a2.z * a2.z) < GRAVITY_MIN) {
++                drv_data->mode = -1;
++                drv_data->t_count = drv_data->l_count = drv_data->n_count = 0;
++                publish_snapshot (drv_data, &a1, 0, FALSE);
++                return G_SOURCE_CONTINUE;
++        }
+ 
+ 	angle = compute_hinge_angle (drv_data, &a1, &a2);
+ 	g_debug ("Hinge angle: %.1f  mode=%d", angle, drv_data->mode);
+ 	update_tablet_mode (sensor_device, angle);
++	publish_snapshot (drv_data, &a1, angle, TRUE);
+ 
+ 	return G_SOURCE_CONTINUE;
+ }
+@@ -1331,6 +1341,7 @@
+ 	drv_data->mode = -1;
+ 	drv_data->cur_orient = -1;
+ 	drv_data->pending_orient = -1;
++	drv_data->physical_orient = -1;
+ 	drv_data->prev_z1 = 1.0f;
+ 	drv_data->prev_z2 = 1.0f;
+ 	drv_data->panel_deg = detect_panel_rotation ();
+@@ -1361,12 +1372,15 @@
+ 		for (gint i = 0; i < found; i++)
+ 			close (drv_data->i2c_fds[i]);
+ 		g_free (drv_data);
++                if (chuwi_application_managed)
++                        exit (EXIT_FAILURE);
+ 		return NULL;
+ 	}
+ 
+ 	/* Setup uinput for SW_TABLET_MODE */
+-	drv_data->uinput_fd = setup_uinput ();
+-	if (drv_data->uinput_fd < 0)
++	if (!chuwi_application_managed)
++		drv_data->uinput_fd = setup_uinput ();
++	if (drv_data->uinput_fd < 0 && !chuwi_application_managed)
+ 		g_warning ("Cannot create uinput device for SW_TABLET_MODE");
+ 	else
+ 		g_debug ("Created uinput device for SW_TABLET_MODE");
+@@ -1425,6 +1439,9 @@
+ 	DrvData *drv_data = (DrvData *) sensor_device->priv;
+ 	const char *reason;
+ 
++	chuwi_invalidate ();
++	drv_data->mode = -1;
++	drv_data->t_count = drv_data->l_count = 0;
+ 	g_source_remove (drv_data->timeout_id);
+ 	drv_data->timeout_id = 0;
+ 
+@@ -1570,6 +1587,7 @@
+ static void
+ mxc6655_close (SensorDevice *sensor_device)
+ {
++        chuwi_invalidate ();
+ 	DrvData *drv_data = (DrvData *) sensor_device->priv;
+ 
+ 	if (drv_data->lid_watch_id > 0)
+--- a/iio-sensor-proxy/src/iio-sensor-proxy.c
++++ b/iio-sensor-proxy/src/iio-sensor-proxy.c
+@@ -22,6 +22,7 @@
+ #include <gudev/gudev.h>
+ #include <polkit/polkit.h>
+ #include "drivers.h"
++#include "chuwi-extension.h"
+ #include "orientation.h"
+ 
+ #include "iio-sensor-proxy-resources.h"
+@@ -751,6 +752,7 @@
+ 		data->clients[i] = create_clients_hash_table ();
+ 
+ 	data->connection = g_object_ref (connection);
++	chuwi_export (connection);
+ }
+ 
+ static void
+@@ -1152,6 +1154,7 @@
+ 	gboolean replace = FALSE;
+ 	gboolean lazy = FALSE;
+ 	const GOptionEntry options[] = {
++		{ "application-managed", 0, 0, G_OPTION_ARG_NONE, &chuwi_application_managed, "Disable ACPI and virtual tablet switch input control", NULL },
+ 		{ "verbose", 'v', 0, G_OPTION_ARG_NONE, &verbose, "Show extra debugging information", NULL },
+ 		{ "replace", 'r', 0, G_OPTION_ARG_NONE, &replace, "Replace the running instance of iio-sensor-proxy", NULL },
+ 		{ "lazy", 0, 0, G_OPTION_ARG_NONE, &lazy, "Only poll sensors while a D-Bus client has claimed them", NULL },
+@@ -1181,7 +1184,7 @@
+ 	data->previous_orientation = ORIENTATION_UNDEFINED;
+ 	data->previous_tilt = TILT_UNDEFINED;
+ 	data->uses_lux = TRUE;
+-	data->lazy = lazy;
++	data->lazy = lazy || chuwi_application_managed;
+ 
+ 	/* Set up D-Bus */
+ 	setup_dbus (data, replace);
+--- a/iio-sensor-proxy/src/meson.build
++++ b/iio-sensor-proxy/src/meson.build
+@@ -23,6 +23,7 @@
+ 
+ sources = [
+   'iio-sensor-proxy.c',
++  'chuwi-extension.c',
+   'drivers.c',
+   'orientation.c',
+   'drv-mxc6655-accel.c',
+@@ -85,7 +86,8 @@
+ test('test-orientation', test_orientation)
+ 
+ test_mxc6655_accel_claim = executable('test-mxc6655-accel-claim',
+-  [ 'test-mxc6655-accel-claim.c', 'accel-scale.c' ],
++  [ 'test-mxc6655-accel-claim.c',
++      'chuwi-extension.c', 'accel-scale.c' ],
+   dependencies: deps,
+   install: false
+ )
+@@ -106,3 +108,7 @@
+   install: true,
+   install_dir: bindir
+ )
++
++test_chuwi_extension = executable('test-chuwi-extension',
++  ['test-chuwi-extension.c', 'chuwi-extension.c'], dependencies: deps)
++test('test-chuwi-extension', test_chuwi_extension)
+--- a/iio-sensor-proxy/src/test-chuwi-extension.c
++++ b/iio-sensor-proxy/src/test-chuwi-extension.c
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#include "chuwi-extension.h"
++
++static void test_snapshot (void)
++{
++    double gravity[3] = {0.4,-0.8,0.2};
++    gint64 first, second;
++    const gchar *mode, *owner;
++    gboolean valid;
++    chuwi_application_managed = TRUE;
++    chuwi_publish(0, 100, TRUE, gravity, "normal", 90);
++    GVariant *s = chuwi_snapshot();
++    g_assert_true(g_variant_lookup(s, "sample_monotonic_us", "x", &first));
++    g_assert_true(g_variant_lookup(s, "input_owner", "&s", &owner));
++    g_assert_cmpstr(owner, ==, "application");
++    GVariant *g = g_variant_lookup_value(s, "display_gravity", G_VARIANT_TYPE("ad"));
++    gsize n; const double *v = g_variant_get_fixed_array(g, &n, sizeof(double));
++    g_assert_cmpuint(n, ==, 3); g_assert_cmpfloat(v[0], ==, gravity[0]);
++    g_variant_unref(g);g_variant_unref(s);
++    chuwi_publish(0, 101, TRUE, gravity, "normal", 90);
++    s = chuwi_snapshot();g_variant_lookup(s,"sample_monotonic_us","x",&second);
++    g_assert_cmpint(first, ==, second);g_variant_unref(s);
++    chuwi_publish(1, 230, TRUE, gravity, "normal", 90);
++    s = chuwi_snapshot();g_variant_lookup(s,"mode","&s",&mode);
++    g_assert_cmpstr(mode, ==, "tablet");g_variant_unref(s);
++    chuwi_publish(1, 230, FALSE, gravity, "normal", 90);
++    s = chuwi_snapshot();g_variant_lookup(s,"mode","&s",&mode);
++    g_assert_cmpstr(mode, ==, "unknown");g_variant_unref(s);
++    chuwi_invalidate();s=chuwi_snapshot();g_variant_lookup(s,"valid","b",&valid);
++    g_assert_false(valid);g_variant_unref(s);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc,&argv,NULL);
++    g_test_add_func("/chuwi/snapshot-throttling-mode-gravity-invalidation",test_snapshot);
++    return g_test_run();
++}
+--- a/iio-sensor-proxy/src/test-mxc6655-accel-claim.c
++++ b/iio-sensor-proxy/src/test-mxc6655-accel-claim.c
+@@ -98,6 +98,32 @@
+ 	driver_close (sd);
+ }
+ 
++static void
++test_application_managed_hysteresis (void)
++{
++        CallbackCapture cap = { 0 };
++        SensorDevice *sd = make_test_device (MXC_ORIENT_NORMAL, &cap);
++        DrvData *data = sd->priv;
++        chuwi_application_managed = TRUE;
++        data->mode = -1;
++        data->tablet_thresh = 185;
++        data->laptop_thresh = 175;
++        data->min_angle = 30;
++        for (gint i = 0; i < 5; i++)
++                update_tablet_mode (sd, 240);
++        g_assert_cmpint(data->mode, ==, -1);
++        update_tablet_mode(sd, 240);
++        g_assert_cmpint(data->mode, ==, 1);
++        for (gint i = 0; i < 10; i++)
++                update_tablet_mode (sd, 180);
++        g_assert_cmpint(data->mode, ==, 1);
++        for (gint i = 0; i < 6; i++)
++                update_tablet_mode (sd, 100);
++        g_assert_cmpint(data->mode, ==, 0);
++        g_assert_cmpint(data->uinput_fd, ==, -1);
++        driver_close(sd);
++}
++
+ int
+ main (int    argc,
+       char **argv)
+@@ -109,5 +135,6 @@
+ 	g_test_add_func ("/mxc6655/repeated-claim-unknown-orientation",
+ 			 test_repeated_claim_unknown_orientation);
+ 
++        g_test_add_func("/mxc6655/application-managed-hysteresis", test_application_managed_hysteresis);
+ 	return g_test_run ();
+ }

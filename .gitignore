@@ -5,3 +5,10 @@ __pycache__/
 .codex/
 
 .DS_Store
+.build/
+dist/
+
+# Local build, machine observations and raw validation evidence
+docs/validation/*.log
+docs/validation/*.json
+reports/

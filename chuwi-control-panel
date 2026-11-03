@@ -1,0 +1,1224 @@
+#!/usr/bin/env python3
+"""Cinnamon control center, using the existing chuwi-autorotate service."""
+from concurrent.futures import ThreadPoolExecutor
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import time
+
+import cairo
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+from chuwi_tablet import floating_position
+from chuwi_tablet_client import TabletClient
+from chuwi.hardware import Hardware
+from chuwi.trackpad_ui import TrackpadPage
+from chuwi.profiles import identify, settings_command
+CONFIG = Path.home() / ".config/chuwi-autorotate/config.conf"
+STATE = Path.home() / ".local/state/chuwi-autorotate/state.json"
+ENGINE = ROOT / "chuwi-autorotate"
+ROTATIONS = {"right": "Landscape", "normal": "Portrait", "left": "Landscape flipped", "inverted": "Portrait flipped"}
+CSS = b"""window { background: #f6f7fb; color: #20283b; }
+headerbar { background: #ffffff; border-bottom: 1px solid #e4e7ef; box-shadow: none; }
+.sidebar { background: #182338; color: #dbe2f0; padding: 22px 14px; }
+.brand { font-size: 23px; font-weight: 800; color: #ffffff; }
+.sidebar .subtle { color: #9eaec8; }
+.sidebar button { background: transparent; color: #dbe2f0; border: none; box-shadow: none; padding: 14px 10px; border-radius: 9px; }
+.sidebar button:checked { background: #344264; color: #ffffff; }
+.page { padding: 26px; }
+.eyebrow { color: #626a82; font-size: 10px; font-weight: bold; letter-spacing: 1px; }
+.title { font-size: 27px; font-weight: 800; }
+.section-title { font-size: 17px; font-weight: bold; }
+.subtle { color: #67728a; }
+.card { background: #ffffff; border: 1px solid #e1e5ef; border-radius: 13px; padding: 18px; }
+.hero { background: #ebeffa; border: 1px solid #dce3f5; border-radius: 13px; padding: 18px; }
+.hero-value { font-size: 24px; font-weight: bold; color: #344886; }
+.badge { background: #e5f3ed; color: #24694e; border-radius: 12px; padding: 5px 10px; font-size: 11px; font-weight: bold; }
+.notice { color: #8a412b; background: #fff0e7; padding: 10px; border-radius: 6px; }
+button { border-radius: 7px; padding: 9px 12px; }
+button.suggested-action { background: #5168bb; color: white; border-color: #5168bb; }
+button.tablet-tile { padding: 0; border-radius: 22px; border: 1px solid #7b86ed; background-image: linear-gradient(145deg, #5364d9, #6951b9); box-shadow: 0 7px 18px alpha(#444fa2, 0.20); }
+button.tablet-tile:hover { background-image: linear-gradient(145deg, #6275eb, #795dcf); border-color: #aab9ff; }
+button.tablet-tile:active { box-shadow: none; }
+button.tablet-tile:focus { outline-color: #263e91; outline-width: 3px; outline-offset: 3px; }
+button.tablet-tile.tablet-on { background-image: linear-gradient(145deg, #188b92, #21647f); border-color: #52b7ba; }
+button.tablet-tile.tablet-on:hover { background-image: linear-gradient(145deg, #209fa5, #2a7895); }
+.tablet-tile-title { color: #ffffff; font-size: 18px; font-weight: bold; }
+button.picture-tile { padding: 12px 6px; border-radius: 18px; border: 1px solid #d9e0f5; background-image: linear-gradient(145deg, #f2f5ff, #e9edfb); box-shadow: 0 3px 9px alpha(#46548e, 0.08); }
+button.picture-tile:hover { background-image: linear-gradient(145deg, #e8eeff, #e1e7fb); border-color: #9eade0; }
+button.picture-tile:checked, button.picture-tile.suggested-action { background-image: linear-gradient(145deg, #5364d9, #6951b9); border-color: #7b86ed; }
+button.picture-tile:checked .picture-title, button.picture-tile.suggested-action .picture-title { color: #ffffff; }
+button.picture-tile:disabled { opacity: 0.48; }
+.picture-title { color: #344466; font-size: 14px; font-weight: bold; }
+button.picture-button { border-radius: 12px; padding: 7px 12px; border-color: #d4dcf1; background: #f0f3fd; color: #344466; }
+button.picture-button:hover { background: #e4eafa; border-color: #9eade0; }
+button.picture-button.suggested-action { background-image: linear-gradient(135deg, #5266ca, #6954b8); color: white; border-color: #7b86ed; }
+button.picture-button.suggested-action label { color: white; }
+button.picture-tile:focus, button.picture-button:focus { outline-color: #5266ca; outline-width: 2px; outline-offset: 2px; }
+.control-picture { background: #edf1fd; border-radius: 12px; padding: 5px; }
+switch { border-radius: 16px; min-width: 46px; min-height: 24px; background: #dbe1ed; border: none; }
+switch:checked { background-image: none; background-color: #5168bb; }
+switch slider { background: #ffffff; border-radius: 12px; min-width: 20px; min-height: 20px; border: 1px solid #ccd1df; }
+.rotation-button { padding: 13px 7px; }
+.rotation-button:checked { background: #e8edfc; color: #354d97; border-color: #b5c3ed; }
+separator { background: #edf0f6; }
+"""
+
+
+def label(text="", style=None, wrap=False):
+    result = Gtk.Label(label=text, xalign=0)
+    if style:
+        result.get_style_context().add_class(style)
+    result.set_line_wrap(wrap)
+    result.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    return result
+
+
+def box(vertical=True, spacing=10, style=None):
+    widget = Gtk.Box(orientation=Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL, spacing=spacing)
+    if style:
+        widget.get_style_context().add_class(style)
+    return widget
+
+
+def read_text(path, default="Unavailable"):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def read_config():
+    return dict(line.split("=", 1) for line in read_text(CONFIG, "").splitlines() if "=" in line and not line.startswith("#"))
+
+
+def command(*args):
+    return subprocess.run([str(ENGINE), *args], capture_output=True, text=True, timeout=35,
+                          env={**os.environ, "LC_ALL": "C"})
+
+
+def snapshot():
+    result = command("status")
+    if result.returncode:
+        raise RuntimeError(result.stderr or result.stdout)
+    status = dict(line.split(": ", 1) for line in result.stdout.splitlines() if ": " in line)
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        state = {}
+    return status, read_config(), state
+
+
+class ScreenPreview(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.rotation = "right"
+        self.set_size_request(170, 115)
+        self.connect("draw", self.draw_screen)
+
+    def draw_screen(self, widget, cr):
+        width, height = self.get_allocated_width(), self.get_allocated_height()
+        w, h = (146, 88) if self.rotation in ("right", "left") else (78, 108)
+        x, y = (width-w)/2, (height-h)/2
+        cr.set_source_rgb(.16, .22, .36)
+        cr.rectangle(x, y, w, h)
+        cr.fill()
+        cr.set_source_rgb(.34, .43, .70)
+        cr.rectangle(x+5, y+5, w-10, h-10)
+        cr.fill()
+        cr.set_source_rgb(.85, .91, 1)
+        cr.select_font_face("Sans", 0, 1)
+        cr.set_font_size(14)
+        text = "CHUWI"
+        extents = cr.text_extents(text)
+        cr.move_to(width/2-extents.width/2, height/2+5)
+        cr.show_text(text)
+        cr.set_source_rgb(.37, .84, .69)
+        cr.arc(width/2, y+h-10, 2, 0, 6.283)
+        cr.fill()
+        return False
+
+
+class TabletArtwork(Gtk.DrawingArea):
+    """Scalable folding illustrations; animation is cosmetic and never touches input."""
+    def __init__(self):
+        super().__init__()
+        self.set_size_request(164, 126)
+        self.frame = 0
+        self.active = False
+        self.timer = None
+        self.connect("draw", self.draw_artwork)
+        self.connect("unmap", lambda *_: self.stop())
+        self.connect("destroy", lambda *_: self.stop())
+
+    def start(self, *_args):
+        if not self.active and self.timer is None and Gtk.Settings.get_default().get_property("gtk-enable-animations"):
+            self.timer = GLib.timeout_add(750, self.advance)
+        return False
+
+    def stop(self, *_args):
+        if self.timer is not None:
+            GLib.source_remove(self.timer)
+            self.timer = None
+        self.frame = 2 if self.active else 0
+        self.queue_draw()
+        return False
+
+    def advance(self):
+        self.frame = (self.frame + 1) % 3
+        self.queue_draw()
+        return True
+
+    def set_active(self, active):
+        if self.active != active:
+            self.active = active
+            self.stop()
+
+    def draw_artwork(self, _widget, cr):
+        cr.save()
+        cr.translate(self.get_allocated_width()/2-82, self.get_allocated_height()/2-63)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+
+        def polygon(points, fill, stroke=None, line_width=2):
+            cr.move_to(*points[0])
+            for point in points[1:]:cr.line_to(*point)
+            cr.close_path()
+            cr.set_source_rgba(*fill)
+            cr.fill_preserve()
+            if stroke:
+                cr.set_source_rgba(*stroke);cr.set_line_width(line_width);cr.stroke()
+            else:cr.new_path()
+
+        def screen(outer, inner):
+            polygon(outer, (.10,.17,.35,1), (.90,.95,1,.95), 2.2)
+            cr.save()
+            cr.move_to(*inner[0])
+            for point in inner[1:]:cr.line_to(*point)
+            cr.close_path();cr.clip()
+            gradient=cairo.LinearGradient(25,20,140,105)
+            gradient.add_color_stop_rgb(0,.43,.70,1)
+            gradient.add_color_stop_rgb(1,.20,.38,.80)
+            cr.set_source(gradient);cr.paint()
+            cr.set_source_rgba(.42,1,.91,.90)
+            cr.move_to(14,105);cr.curve_to(50,43,94,109,155,42)
+            cr.line_to(165,126);cr.line_to(14,126);cr.close_path();cr.fill()
+            cr.set_source_rgba(.88,.98,1,.38)
+            cr.move_to(20,38);cr.curve_to(66,62,89,4,152,32)
+            cr.set_line_width(12);cr.stroke()
+            cr.restore()
+
+        # A soft pool anchors the device without adding another icon or label.
+        cr.save();cr.translate(82,103);cr.scale(60,7)
+        cr.set_source_rgba(.10,.16,.35,.20);cr.arc(0,0,1,0,math.tau);cr.fill();cr.restore()
+        if self.frame == 0:
+            screen([(25,23),(123,13),(129,74),(31,83)],[(31,29),(117,20),(122,68),(37,76)])
+            polygon([(31,83),(129,74),(148,98),(14,108)],(.79,.86,1,1),(.94,.97,1,1))
+            cr.set_source_rgba(.27,.37,.64,.65);cr.set_line_width(1.5)
+            for y in (84,89,94):
+                cr.move_to(42,y);cr.line_to(119,y-7);cr.stroke()
+            polygon([(65,98),(89,96),(94,101),(63,104)],(.42,.54,.79,.7))
+            # Fold-back arrow, drawn as part of the illustration.
+            cr.set_source_rgba(.79,1,.96,.95);cr.set_line_width(2.5)
+            cr.move_to(15,58);cr.curve_to(2,35,9,12,27,8);cr.stroke()
+            cr.move_to(21,4);cr.line_to(28,8);cr.line_to(22,14);cr.stroke()
+        elif self.frame == 1:
+            polygon([(67,17),(15,91),(43,87),(78,28)],(.72,.81,1,.85),(.94,.97,1,.95))
+            screen([(67,17),(143,33),(118,105),(40,88)],[(70,25),(134,39),(112,97),(48,83)])
+            cr.set_source_rgba(.79,1,.96,.95);cr.set_line_width(2.5)
+            cr.move_to(24,47);cr.curve_to(17,30,25,12,43,10);cr.stroke()
+            cr.move_to(37,6);cr.line_to(44,10);cr.line_to(38,16);cr.stroke()
+        else:
+            screen([(26,28),(132,14),(144,91),(38,106)],[(33,34),(126,21),(136,85),(44,98)])
+            cr.set_source_rgba(.90,.95,1,.9);cr.arc(80,24,1.5,0,math.tau);cr.fill()
+            if self.active:
+                cr.set_source_rgb(.79,1,.93);cr.arc(134,91,15,0,math.tau);cr.fill()
+                cr.set_source_rgb(.09,.36,.41);cr.set_line_width(2.2)
+                cr.arc(134,88,4,math.pi,math.tau);cr.stroke()
+                cr.rectangle(128,88,12,9);cr.fill()
+        for index in range(3):
+            cr.set_source_rgba(1,1,1,.95 if self.frame == index else .30)
+            cr.arc(70+index*12,120,2.3,0,math.tau);cr.fill()
+        cr.restore()
+        return False
+
+
+class ControlArtwork(Gtk.DrawingArea):
+    """Static vector pictures shared by action buttons and navigation."""
+    def __init__(self, kind, width=100, height=82):
+        super().__init__()
+        self.kind = kind
+        self.set_size_request(width, height)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        self.connect("draw", self.draw_picture)
+
+    def draw_picture(self, _widget, cr):
+        width, height = self.get_allocated_width(), self.get_allocated_height()
+        scale = min(width/120, height/100)
+        cr.save();cr.translate((width-120*scale)/2,(height-100*scale)/2);cr.scale(scale,scale)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND);cr.set_line_cap(cairo.LINE_CAP_ROUND)
+
+        def path(points, color, stroke=None, thickness=2.5):
+            cr.move_to(*points[0])
+            for point in points[1:]:cr.line_to(*point)
+            cr.close_path();cr.set_source_rgba(*color);cr.fill_preserve()
+            if stroke:
+                cr.set_source_rgba(*stroke);cr.set_line_width(thickness);cr.stroke()
+            else:cr.new_path()
+
+        def rounded(x,y,w,h,r,color,stroke=None):
+            cr.new_sub_path();cr.arc(x+w-r,y+r,r,-math.pi/2,0)
+            cr.arc(x+w-r,y+h-r,r,0,math.pi/2);cr.arc(x+r,y+h-r,r,math.pi/2,math.pi)
+            cr.arc(x+r,y+r,r,math.pi,math.pi*1.5);cr.close_path()
+            cr.set_source_rgba(*color);cr.fill_preserve()
+            if stroke:
+                cr.set_source_rgba(*stroke);cr.set_line_width(2.5);cr.stroke()
+            else:cr.new_path()
+
+        navy=(.14,.23,.41,1);edge=(.85,.91,1,1);cyan=(.34,.91,.82,1)
+        blue=(.36,.51,.90,1);pale=(.91,.95,1,1);white=(1,1,1,1)
+        def line(points,color=navy,thickness=3):
+            cr.set_source_rgba(*color);cr.set_line_width(thickness);cr.move_to(*points[0])
+            for point in points[1:]:cr.line_to(*point)
+            cr.stroke()
+
+        def circle(x,y,r,color):
+            cr.set_source_rgba(*color);cr.arc(x,y,r,0,math.tau);cr.fill()
+
+        def device(w=98,h=65,flip=False):
+            cr.save();cr.translate(60,48)
+            if flip:cr.rotate(math.pi)
+            rounded(-w/2,-h/2,w,h,6,navy,edge)
+            cr.rectangle(-w/2+6,-h/2+7,w-12,h-14)
+            gradient=cairo.LinearGradient(-w/2,-h/2,w/2,h/2)
+            gradient.add_color_stop_rgb(0,.48,.72,1);gradient.add_color_stop_rgb(1,.27,.43,.84)
+            cr.set_source(gradient);cr.fill()
+            cr.save();cr.rectangle(-w/2+6,-h/2+7,w-12,h-14);cr.clip()
+            cr.set_source_rgba(*cyan);cr.move_to(-w/2,h/2)
+            cr.curve_to(-w/4,-h/4,w/8,h/2,w/2,-h/10)
+            cr.line_to(w/2,h/2);cr.close_path();cr.fill()
+            line([(-w/2,-h/5),(w/2,-h/3)],(.87,.96,1,.35),9)
+            cr.restore();circle(0,-h/2+3,1.2,pale);cr.restore()
+
+        def check(x=83,y=75):
+            circle(x,y,15,cyan)
+            line([(x-7,y),(x-2,y+5),(x+8,y-6)],navy,3.2)
+
+        kind=self.kind
+        if kind == "trackpad":
+            rounded(15,15,90,70,8,pale,navy)
+            line([(20,62),(100,62)],blue,2)
+            line([(60,62),(60,80)],blue,2)
+            circle(60,35,9,cyan)
+        elif kind in ROTATIONS:
+            device(98,65,kind=="left") if kind in ("right","left") else device(57,84,kind=="inverted")
+        elif kind in ("home","calibrate","display","rotate","lock","startup"):
+            device(92,59)
+            if kind=="home":
+                path([(14,78),(106,78),(116,91),(4,91)],edge,white)
+                rounded(49,82,22,5,2,blue)
+                path([(89,21),(105,8),(120,21)],cyan)
+                rounded(93,20,22,16,2,cyan);rounded(102,25,6,11,1,navy)
+            elif kind=="calibrate":
+                circle(60,48,19,(1,1,1,.85));circle(60,48,12,(.84,.40,.62,1));circle(60,48,5,white)
+                line([(60,21),(60,35)],navy,2);line([(60,61),(60,75)],navy,2)
+                line([(33,48),(47,48)],navy,2);line([(73,48),(87,48)],navy,2)
+            elif kind=="display":
+                path([(51,79),(69,79),(73,89),(47,89)],navy)
+                rounded(38,87,44,5,2,navy)
+                circle(101,20,12,(1,.77,.30,1))
+            elif kind=="startup":
+                circle(93,75,17,cyan);line([(93,86),(93,65)],navy,3)
+                line([(85,73),(93,65),(101,73)],navy,3)
+            elif kind=="lock":
+                rounded(82,65,27,23,4,cyan)
+                cr.set_source_rgba(*navy);cr.set_line_width(4);cr.arc(95,64,8,math.pi,math.tau);cr.stroke()
+            else:
+                cr.set_source_rgba(*navy);cr.set_line_width(4);cr.arc(60,48,43,.15,2.9);cr.stroke()
+                path([(15,48),(15,64),(29,57)],cyan)
+        elif kind=="power":
+            rounded(19,27,80,47,9,navy,edge);rounded(99,40,8,20,3,navy)
+            rounded(26,34,51,33,4,cyan)
+            path([(64,15),(44,52),(59,52),(51,84),(82,43),(66,43)],(1,.76,.32,1),pale,1.5)
+        elif kind=="keyboard":
+            rounded(8,22,104,64,10,navy,edge)
+            rounded(14,28,92,52,6,blue)
+            for row in range(3):
+                for column in range(8):
+                    rounded(20+column*10.5,35+row*10,7,6,1.5,pale)
+            rounded(39,66,43,7,2,cyan)
+            circle(101,18,14,cyan)
+            line([(95,18),(107,18)],navy,2.5)
+            line([(101,12),(101,24)],navy,2.5)
+        elif kind in ("doctor","health"):
+            rounded(28,12,64,79,8,navy,edge);rounded(35,20,50,62,4,pale)
+            rounded(47,8,27,12,4,blue)
+            line([(41,49),(48,49),(54,36),(62,65),(69,45),(78,45)],blue,3)
+            check(87,77)
+        elif kind=="save":
+            path([(25,12),(83,12),(97,26),(97,88),(25,88)],blue,edge)
+            rounded(37,13,43,25,2,pale);rounded(65,15,9,20,1,navy)
+            rounded(37,53,46,29,3,navy);check(93,78)
+        elif kind in ("unlock","confirm"):
+            if kind=="unlock":
+                rounded(29,43,64,46,9,blue,edge)
+                cr.set_source_rgba(*navy);cr.set_line_width(8)
+                cr.arc(61,38,20,math.pi,math.tau-.55);cr.stroke()
+                circle(61,62,5,pale);line([(61,62),(61,74)],pale,4)
+                check(94,80)
+            else:
+                circle(58,34,25,(.37,.74,.94,.22));circle(58,34,17,(.37,.74,.94,.30))
+                rounded(50,26,14,43,7,pale,blue)
+                path([(40,56),(51,65),(51,49),(84,57),(89,73),(78,92),(51,92),(30,68)],pale,blue)
+                line([(65,57),(65,69)],blue,2);line([(75,60),(75,71)],blue,2)
+        elif kind=="projects":
+            path([(14,27),(48,27),(56,36),(106,36),(106,86),(14,86)],navy,edge)
+            rounded(19,42,82,44,5,blue)
+            line([(43,58),(43,74),(76,74),(76,58)],cyan,3)
+            for x,y in ((43,58),(76,58),(43,74)):circle(x,y,5,pale)
+        elif kind=="refresh":
+            circle(60,50,35,(.83,.90,1,1))
+            cr.set_source_rgba(*blue);cr.set_line_width(8);cr.arc(60,50,27,.6,5.9);cr.stroke()
+            path([(91,30),(93,52),(74,44)],navy)
+        elif kind=="info":
+            circle(60,50,35,blue);circle(60,32,5,white)
+            line([(60,47),(60,69)],white,8)
+        cr.restore()
+        return False
+
+
+def picture_button(widget, caption, kind, *, tile=False, accessible=None, size=None):
+    """Decorate the existing widget, preserving its signal handlers and semantics."""
+    previous=widget.get_child()
+    if previous is not None:widget.remove(previous)
+    content=box(tile,8 if tile else 9)
+    content.set_halign(Gtk.Align.CENTER);content.set_valign(Gtk.Align.CENTER)
+    width,height=size or ((100,82) if tile else (32,28))
+    content.pack_start(ControlArtwork(kind,width,height),False,False,0)
+    if caption:
+        title=label(caption,"picture-title" if tile else None,True)
+        title.set_xalign(.5 if tile else 0)
+        if tile:title.set_max_width_chars(16)
+        content.pack_start(title,False,False,0)
+    widget.add(content)
+    widget.get_style_context().add_class("picture-tile" if tile else "picture-button")
+    widget.get_accessible().set_name(accessible or caption)
+    widget.set_tooltip_text(accessible or caption)
+    if tile:widget.set_size_request(108,140)
+    return widget
+
+
+class ControlCenter(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.kaoshonen.ChuwiControl", flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self.busy = False
+        self.refreshing = False
+        self.updating = False
+        self.window = None
+        self.actions = []
+        self.toggles = {}
+        self.rotation_buttons = {}
+        self.values = {}
+        self.sensitivity_dirty = False
+        self.tablet = None
+        self.floating = None
+        self.closing = False
+        self.keyboard_pending = False
+        self.keyboard_buttons = []
+        self.keyboard_error = None
+        self.hardware_reader = Hardware()
+        self.hardware_values = {}
+        self.hardware_pending = False
+        self.hardware_at = 0
+        self.recovery_only = False
+        self.automatic_last = False
+        self.automatic_pending = False
+        self.held = False
+        schemas = Gio.SettingsSchemaSource.get_default()
+        self.keyboard_settings = (Gio.Settings.new("org.cinnamon.keyboard")
+                                  if schemas and schemas.lookup("org.cinnamon.keyboard", True) else None)
+        if self.keyboard_settings:
+            self.keyboard_settings.connect("changed::keyboard-position", lambda *_: self.position_floating())
+        self.tablet_state = {"phase": "off", "reason": "Keyboard and touchpad are available"}
+        for name, callback in (("tablet-trial", self.enable_tablet), ("tablet-unlock", self.unlock_tablet)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _action, _parameter, cb=callback: cb())
+            self.add_action(action)
+
+    def do_command_line(self, command_line):
+        recovery = "--recovery" in command_line.get_arguments()
+        self.recovery_only = recovery
+        self.do_activate()
+        return 0
+
+    def do_activate(self):
+        if self.window is None:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.build_window()
+            self.tablet = TabletClient(self.tablet_changed, self.tablet_ready)
+            self.trackpad_page.refresh()
+            self.refresh()
+            GLib.timeout_add_seconds(2, self.refresh)
+            GLib.timeout_add(500, self.automatic_tick)
+        if self.recovery_only:
+            if not self.held:
+                self.hold()
+                self.held = True
+            self.window.hide()
+        else:
+            self.window.show_all()
+            self.notice.hide()
+            self.window.present()
+
+    def page(self, title, subtitle):
+        content = box(style="page", spacing=16)
+        content.pack_start(label("CHUWI CONTROL CENTER", "eyebrow"), False, False, 0)
+        content.pack_start(label(title, "title"), False, False, 0)
+        content.pack_start(label(subtitle, "subtle", True), False, False, 0)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(content)
+        return scroller, content
+
+    def button(self, text, action, *args, primary=False):
+        kind={"reset":"home","calibrate-home":"calibrate","doctor":"doctor"}[action]
+        widget = picture_button(Gtk.Button(),text,kind,tile=True)
+        if primary:
+            widget.get_style_context().add_class("suggested-action")
+        widget.connect("clicked", lambda _: self.run_action(action, *args))
+        self.actions.append(widget)
+        return widget
+
+    def toggle_row(self, parent, title, description, name, action, choices):
+        row = box(False, 16)
+        picture=ControlArtwork({"auto":"rotate","lock":"lock","startup":"startup"}[name],40,36)
+        picture.get_style_context().add_class("control-picture")
+        row.pack_start(picture,False,False,0)
+        text = box(spacing=3)
+        text.pack_start(label(title), False, False, 0)
+        text.pack_start(label(description, "subtle", True), False, False, 0)
+        row.pack_start(text, True, True, 0)
+        switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        switch.get_accessible().set_name(title)
+        switch.connect("state-set", lambda _, state: self.toggle(name, action, choices, state))
+        self.toggles[name] = switch
+        self.actions.append(switch)
+        row.pack_end(switch, False, False, 0)
+        parent.pack_start(row, False, False, 0)
+
+    def build_window(self):
+        self.window = Gtk.ApplicationWindow(application=self, title="CHUWI Control Center")
+        self.window.set_default_size(1000, 800)
+        self.window.set_size_request(760, 570)
+        self.window.set_icon_name("chuwi-autorotate-panel")
+        self.window.connect("delete-event", self.close_panel)
+        header = Gtk.HeaderBar(title="MiniBook X", subtitle="Control Center", show_close_button=True)
+        self.window.set_titlebar(header)
+        refresh = picture_button(Gtk.Button(),"","refresh",size=(24,24),accessible="Refresh device status")
+        refresh.connect("clicked", lambda _: self.refresh())
+        header.pack_start(refresh)
+        self.header_unlock = picture_button(Gtk.Button(),"Unlock keyboard & touchpad","unlock",size=(24,24))
+        self.header_unlock.set_no_show_all(True)
+        self.header_unlock.get_child().show_all()
+        self.header_unlock.connect("clicked", lambda _: self.unlock_tablet())
+        header.pack_end(self.header_unlock)
+        about = picture_button(Gtk.Button(),"","info",size=(24,24),accessible="About CHUWI Control Center")
+        about.connect("clicked", self.about)
+        header.pack_end(about)
+        root = box(False, 0)
+        self.window.add(root)
+        sidebar = box(style="sidebar", spacing=8)
+        sidebar.set_size_request(182, -1)
+        sidebar.pack_start(label("CHUWI", "brand"), False, False, 0)
+        sidebar.pack_start(label("MiniBook X · Linux Mint", "subtle"), False, False, 0)
+        spacer = Gtk.Box()
+        spacer.set_size_request(-1, 20)
+        sidebar.pack_start(spacer, False, False, 0)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        first = None
+        for key, title, builder in (("display", "Display & rotation", self.build_display), ("trackpad", "Trackpad", self.build_trackpad), ("device", "Device health", self.build_device), ("projects", "Projects & sources", self.build_projects)):
+            widget = Gtk.RadioButton.new_from_widget(first)
+            first = first or widget
+            widget.set_mode(False)
+            picture_button(widget,title,{"display":"display","trackpad":"trackpad","device":"health","projects":"projects"}[key],size=(28,26))
+            widget.get_style_context().remove_class("picture-button")
+            widget.get_child().get_children()[-1].set_max_width_chars(13)
+            widget.connect("toggled", lambda w, k=key: self.stack.set_visible_child_name(k) if w.get_active() else None)
+            sidebar.pack_start(widget, False, False, 0)
+            self.stack.add_named(builder(), key)
+        sidebar.pack_end(label("Made by Kyle Auchterlonie\n2026 · Version 0.2", "subtle"), False, False, 0)
+        root.pack_start(sidebar, False, False, 0)
+        main = box(spacing=0)
+        self.notice = label("", "notice", True)
+        self.notice.set_no_show_all(True)
+        main.pack_start(self.notice, False, False, 0)
+        main.pack_start(self.stack, True, True, 0)
+        self.message = label("Connecting to rotation service…", "subtle", True)
+        self.message.set_margin_start(26)
+        self.message.set_margin_end(26)
+        self.message.set_margin_bottom(12)
+        main.pack_end(self.message, False, False, 0)
+        root.pack_start(main, True, True, 0)
+
+    def build_trackpad(self):
+        self.trackpad_page = TrackpadPage(self)
+        return self.trackpad_page.widget
+
+    def build_display(self):
+        scroll, page = self.page("A screen that follows you", "Settle into laptop mode, turn to portrait, or lock the view you prefer.")
+        hero = box(False, 16, "hero")
+        self.preview = ScreenPreview()
+        hero.pack_start(self.preview, False, False, 0)
+        details = box(spacing=8)
+        self.rotation_title = label("Reading display…", "hero-value", True)
+        self.rotation_detail = label("", "subtle", True)
+        self.badge = label("Connecting", "badge")
+        self.badge.set_halign(Gtk.Align.START)
+        details.pack_start(self.rotation_title, False, False, 0)
+        details.pack_start(self.rotation_detail, False, False, 0)
+        details.pack_start(self.badge, False, False, 0)
+        hero.pack_start(details, True, True, 0)
+        page.pack_start(hero, False, False, 0)
+        settings = box(style="card", spacing=13)
+        self.toggle_row(settings, "Auto rotate", "Follow the screen’s orientation sensor.", "auto", None, ("on", "off"))
+        settings.pack_start(Gtk.Separator(), False, False, 0)
+        self.toggle_row(settings, "Rotation lock", "Hold this orientation until you unlock it.", "lock", "lock", ("on", "off"))
+        settings.pack_start(Gtk.Separator(), False, False, 0)
+        self.toggle_row(settings, "Start at sign-in", "Apply your saved laptop orientation when the desktop starts.", "startup", "startup", ("on", "off"))
+        page.pack_start(settings, False, False, 0)
+        page.pack_start(self.build_tablet(), False, False, 0)
+        page.pack_start(self.build_sensitivity(), False, False, 0)
+        manual = box(style="card", spacing=10)
+        manual.pack_start(label("Choose an orientation", "section-title"), False, False, 0)
+        manual.pack_start(label("Choosing a view also turns on rotation lock.", "subtle", True), False, False, 0)
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8, column_homogeneous=True)
+        for index, (rotation, title) in enumerate(ROTATIONS.items()):
+            button = picture_button(Gtk.ToggleButton(),title,rotation,tile=True)
+            button.connect("clicked", lambda _, r=rotation: self.run_action("rotate", r) if not self.updating else None)
+            self.rotation_buttons[rotation] = button
+            self.actions.append(button)
+            grid.attach(button, index, 0, 1, 1)
+        manual.pack_start(grid, False, False, 0)
+        page.pack_start(manual, False, False, 0)
+        tools = box(False, 8)
+        home=self.button("Laptop view", "reset", primary=True)
+        home.set_tooltip_text("Return to your saved laptop orientation")
+        tools.pack_start(home, True, True, 0)
+        calibrate=self.button("Calibrate", "calibrate-home")
+        calibrate.set_tooltip_text("Save this posture as your laptop position")
+        tools.pack_start(calibrate, True, True, 0)
+        page.pack_start(tools, False, False, 0)
+        page.pack_start(label("Calibrate while the screen and touch are upright in your usual laptop position.", "subtle", True), False, False, 0)
+        return scroll
+
+    def build_tablet(self):
+        card = box(False, 22, "card")
+        self.tablet_button = Gtk.Button()
+        self.tablet_button.set_size_request(196, 196)
+        self.tablet_button.set_halign(Gtk.Align.START)
+        self.tablet_button.set_valign(Gtk.Align.CENTER)
+        self.tablet_button.get_style_context().add_class("tablet-tile")
+        self.tablet_button.get_accessible().set_name("Enable tablet mode")
+        content=box(spacing=8)
+        content.set_halign(Gtk.Align.CENTER);content.set_valign(Gtk.Align.CENTER)
+        self.tablet_artwork=TabletArtwork()
+        content.pack_start(self.tablet_artwork,False,False,0)
+        self.tablet_tile_title=label("Tablet mode","tablet-tile-title")
+        self.tablet_tile_title.set_xalign(.5)
+        content.pack_start(self.tablet_tile_title,False,False,0)
+        self.tablet_button.add(content)
+        self.tablet_button.connect("enter-notify-event",self.tablet_artwork.start)
+        self.tablet_button.connect("leave-notify-event",self.tablet_artwork.stop)
+        self.tablet_button.connect("focus-in-event",self.tablet_artwork.start)
+        self.tablet_button.connect("focus-out-event",self.tablet_artwork.stop)
+        self.tablet_button.connect("clicked", lambda _: self.enable_tablet() if self.tablet_state.get("phase") == "off" else self.unlock_tablet())
+        # This button intentionally stays outside self.actions and the rotation worker queue.
+        card.pack_start(self.tablet_button, False, False, 0)
+        details=box(spacing=8)
+        details.set_valign(Gtk.Align.CENTER)
+        self.tablet_heading=label("Laptop mode","section-title",True)
+        self.tablet_description=label("Keyboard & touchpad available.","subtle",True)
+        self.tablet_hint=label("First use: 10-second touch test.","subtle",True)
+        details.pack_start(self.tablet_heading,False,False,0)
+        details.pack_start(self.tablet_description,False,False,0)
+        details.pack_start(self.tablet_hint,False,False,0)
+        details.pack_start(self.keyboard_button(),False,False,0)
+        self.automatic_check = Gtk.CheckButton(label="Automatic tablet mode")
+        self.automatic_check.set_active(read_config().get("tablet_automatic") == "true")
+        self.automatic_check.connect("toggled", self.set_automatic)
+        details.pack_start(self.automatic_check,False,False,0)
+        osk_check = Gtk.CheckButton(label="Enable screen keyboard in tablet mode")
+        osk_check.set_active(read_config().get('tablet_osk') == 'automatic')
+        osk_check.connect('toggled', lambda button: command('configure', 'tablet_osk', 'automatic' if button.get_active() else 'manual'))
+        details.pack_start(osk_check,False,False,0)
+        self.keyboard_hint=label("Tap to show or hide the screen keyboard.","subtle",True)
+        details.pack_start(self.keyboard_hint,False,False,0)
+        card.pack_start(details,True,True,0)
+        self.tablet_button.set_tooltip_text("Lock the built-in keyboard and touchpad before folding. Touch stays available. First use unlocks after 10 seconds unless confirmed with a touchscreen tap. The recovery window stays available while automatic tablet mode is enabled.")
+        return card
+
+    def set_automatic(self, button):
+        if button.get_active():
+            from chuwi.session import rearm
+            rearm()
+            self.automatic_pending = True
+            self.enable_tablet()
+        else:
+            self.automatic_pending = False
+            command("configure", "tablet_automatic", "false")
+            self.unlock_tablet()
+
+    def automatic_tick(self):
+        if self.closing:
+            return False
+        from chuwi.session import read, inhibited
+        enabled = read_config().get("tablet_automatic") == "true"
+        state = read("controller")
+        capable = bool(state.get('sensor_valid') and state.get('sensor_provider') == 'extended' and state.get('input_owner') == 'application')
+        self.automatic_check.set_sensitive(capable or enabled)
+        self.automatic_check.set_tooltip_text('A touchscreen recovery trial is required before automatic switching' if capable else 'Requires fresh hinge data from the application-managed sensor extension')
+        requested = bool(enabled and state.get("automatic_input_request") and not inhibited())
+        if requested and not self.automatic_last and self.tablet and self.tablet_state.get("phase") == "off":
+            self.tablet.start(automatic=True)
+        if not requested and self.tablet and getattr(self.tablet, "automatic", False):
+            self.tablet.release()
+        self.automatic_last = requested
+        if self.recovery_only and not enabled and self.tablet_state.get("phase") == "off" and not self.automatic_pending:
+            self.quit()
+            return False
+        return True
+
+    def keyboard_button(self):
+        button=picture_button(Gtk.Button(),"Screen keyboard","keyboard",size=(38,36),
+                              accessible="Show or hide the on-screen keyboard")
+        button.set_size_request(-1,60)
+        button.set_focus_on_click(False)
+        button.set_sensitive(not self.keyboard_pending)
+        button.set_tooltip_text("Show or hide Cinnamon’s on-screen keyboard. In tablet mode this control also stays beside Unlock.")
+        button.connect("clicked",lambda _: self.toggle_screen_keyboard())
+        self.keyboard_buttons.append(button)
+        # Independent of rotation jobs and tablet recovery, which must stay responsive.
+        return button
+
+    def toggle_screen_keyboard(self):
+        if self.keyboard_pending or self.closing:
+            return
+        self.keyboard_pending=True
+        for button in self.keyboard_buttons:
+            button.set_sensitive(False)
+        Gio.bus_get(Gio.BusType.SESSION,None,self.keyboard_bus_ready,None)
+
+    def keyboard_bus_ready(self,_source,result,_data):
+        if self.closing:
+            return
+        try:
+            connection=Gio.bus_get_finish(result)
+            if identify()["desktop"] == "xfce":
+                from chuwi.osk import toggle_onboard
+                toggle_onboard(connection)
+                self.keyboard_finished()
+                return
+            connection.call("org.Cinnamon","/org/Cinnamon","org.Cinnamon","ToggleKeyboard",None,None,
+                            Gio.DBusCallFlags.NO_AUTO_START,1500,None,self.keyboard_done,None)
+        except Exception as exc:
+            self.keyboard_finished(str(exc))
+
+    def keyboard_done(self,connection,result,_data):
+        try:
+            connection.call_finish(result)
+            self.keyboard_finished()
+        except Exception as exc:
+            self.keyboard_finished(str(exc))
+
+    def keyboard_finished(self,error=None):
+        self.keyboard_pending=False
+        if self.closing:
+            return
+        self.keyboard_error=("Screen keyboard unavailable. Open Cinnamon’s Accessibility settings to check it."
+                             if error else None)
+        for button in self.keyboard_buttons:
+            button.set_sensitive(True)
+            button.set_tooltip_text(self.keyboard_error or "Tap to show or hide the screen keyboard.")
+        self.keyboard_hint.set_text(self.keyboard_error or "Tap to show or hide the screen keyboard.")
+        if self.floating:
+            self.floating_keyboard_notice.set_text(self.keyboard_error or "")
+            self.floating_keyboard_notice.set_visible(bool(self.keyboard_error))
+        self.position_floating()
+
+    def enable_tablet(self):
+        if self.window is None:
+            self.do_activate()
+        if self.tablet:
+            self.tablet.start()
+
+    def unlock_tablet(self):
+        if self.tablet:
+            self.tablet.unlock()
+
+    def tablet_ready(self):
+        self.show_floating()
+        def begin_after_map():
+            if self.tablet is None:
+                return False
+            if self.floating and self.floating.get_mapped():
+                self.tablet.begin()
+            else:
+                self.tablet.emergency_unlock("Recovery button could not be displayed; tablet mode cancelled")
+            return False
+        GLib.idle_add(begin_after_map)
+
+    def show_floating(self):
+        if self.floating is None:
+            self.floating = Gtk.ApplicationWindow(application=self, title="CHUWI tablet unlock")
+            self.floating.set_decorated(False)
+            self.floating.set_resizable(False)
+            self.floating.set_keep_above(True)
+            self.floating.stick()
+            self.floating.set_skip_taskbar_hint(True)
+            self.floating.set_skip_pager_hint(True)
+            self.floating.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+            self.floating.set_focus_on_map(False)
+            # A tap here must leave the app's text field focused for on-screen typing.
+            self.floating.set_accept_focus(False)
+            self.floating.connect("delete-event", lambda *_: (self.unlock_tablet(), True)[1])
+            content = box(style="card", spacing=10)
+            self.floating.add(content)
+            self.floating_status = label("Checking tablet mode…", "section-title", True)
+            content.pack_start(self.floating_status, False, False, 0)
+            self.touch_confirm = picture_button(Gtk.Button(),"Keep tablet mode","confirm",size=(38,36),accessible="Tap here to keep tablet mode")
+            self.touch_confirm.set_size_request(280, 60)
+            self.touch_confirm.set_can_focus(False)
+            self.touch_gesture = Gtk.GestureMultiPress.new(self.touch_confirm)
+            self.touch_gesture.set_touch_only(True)
+            # Observe native touch before GtkButton translates it into pointer events.
+            self.touch_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            self.touch_gesture.connect("released", self.confirm_tablet_touch)
+            # No clicked handler: mouse clicks, keyboard activation and synthetic clicks cannot confirm.
+            content.pack_start(self.touch_confirm, False, False, 0)
+            self.floating_unlock = picture_button(Gtk.Button(),"Unlock keyboard & touchpad","unlock",size=(38,36))
+            self.floating_unlock.set_size_request(280, 68)
+            self.floating_unlock.set_focus_on_click(False)
+            self.floating_unlock.get_style_context().add_class("suggested-action")
+            self.floating_unlock.connect("clicked", lambda _: self.unlock_tablet())
+            content.pack_start(self.floating_unlock, False, False, 0)
+            self.floating_keyboard=self.keyboard_button()
+            content.pack_start(self.floating_keyboard,False,False,0)
+            self.floating_keyboard_notice=label("","notice",True)
+            self.floating_keyboard_notice.set_max_width_chars(30)
+            self.floating_keyboard_notice.set_no_show_all(True)
+            content.pack_start(self.floating_keyboard_notice,False,False,0)
+            self.floating.connect("size-allocate", lambda *_: self.position_floating())
+            screen = self.floating.get_screen()
+            screen.connect("monitors-changed", lambda *_: self.position_floating())
+            screen.connect("size-changed", lambda *_: self.position_floating())
+        self.floating.show_all()
+        self.floating_keyboard_notice.set_text(self.keyboard_error or "")
+        self.floating_keyboard_notice.set_visible(bool(self.keyboard_error))
+        self.position_floating()
+
+    def position_floating(self):
+        if not self.floating or not self.floating.get_visible():
+            return
+        screen = self.floating.get_screen()
+        output = read_config().get("display", "auto")
+        monitor = next((index for index in range(screen.get_n_monitors())
+                        if screen.get_monitor_plug_name(index) == output), screen.get_primary_monitor())
+        if monitor < 0:
+            monitor = 0
+        area = screen.get_monitor_workarea(monitor)
+        width, height = self.floating.get_size()
+        # Keep recovery on the opposite edge from Cinnamon's keyboard, even before it opens.
+        keyboard_at_top = self.keyboard_settings and self.keyboard_settings.get_string("keyboard-position") == "top"
+        self.floating.move(*floating_position((area.x, area.y, area.width, area.height), (width, height),
+                                              bottom=bool(keyboard_at_top)))
+
+    def confirm_tablet_touch(self, gesture, _count, x, y):
+        width, height = self.touch_confirm.get_allocated_width(), self.touch_confirm.get_allocated_height()
+        sequence = gesture.get_current_sequence()
+        # NULL is GTK's valid sequence for touchscreen-emulated pointer events.
+        event = gesture.get_last_event(sequence)
+        device = event.get_source_device() if event else None
+        touch_release = event is not None and (
+            (event.type == Gdk.EventType.TOUCH_END and sequence is not None)
+            or (event.type == Gdk.EventType.BUTTON_RELEASE and sequence is None and event.get_button() == (True, 1)))
+        actual_touch = (touch_release and not event.send_event
+                        and device is not None and device.get_source() == Gdk.InputSource.TOUCHSCREEN)
+        if actual_touch and gesture.get_touch_only() and 0 <= x < width and 0 <= y < height and self.tablet_state.get("phase") == "trial":
+            self.tablet.confirm_touch()
+
+    def tablet_changed(self, state):
+        self.tablet_state = state
+        if hasattr(self, "trackpad_page"):
+            self.trackpad_page.set_locked(state.get("phase", "off") != "off")
+        if state.get("phase") == "locked" and self.automatic_pending:
+            command("configure", "tablet_automatic", "true")
+            self.automatic_pending = False
+            if self.tablet:
+                self.tablet.automatic = True
+                self.tablet.release()
+        phase = state.get("phase", "off")
+        active = phase != "off"
+        reason = state.get("reason", "")
+        heading, description = {
+            "off": ("Laptop mode", "Keyboard & touchpad available."),
+            "arming": ("Getting ready…", "Checking automatic recovery."),
+            "trial": ("Touch test", "Confirm on the floating button."),
+            "locked": ("Tablet mode on", "Keyboard & touchpad locked."),
+            "recovering": ("Restoring input…", "Keyboard & touchpad will return."),
+            "error": ("Recovery needs attention", reason),
+        }.get(phase, ("Tablet mode", reason))
+        self.tablet_heading.set_text(heading)
+        self.tablet_description.set_text(description)
+        self.tablet_description.set_tooltip_text(reason)
+        self.tablet_hint.set_text("First use: 10-second touch test." if phase in ("off","trial") else "Screen keyboard stays beside Unlock." if phase == "locked" else "")
+        self.tablet_tile_title.set_text("Unlock inputs" if active else "Tablet mode")
+        self.tablet_button.get_accessible().set_name("Unlock keyboard and touchpad" if active else "Enable tablet mode")
+        style=self.tablet_button.get_style_context()
+        style.add_class("tablet-on") if phase in ("trial","locked") else style.remove_class("tablet-on")
+        self.tablet_artwork.set_active(phase in ("trial","locked"))
+        self.tablet_button.set_sensitive(phase != "arming")
+        self.header_unlock.set_visible(active)
+        if phase in ("trial", "locked", "recovering", "error"):
+            self.show_floating()
+            self.floating_status.set_text(f"Test: unlocks in {state.get('remaining', 0)} seconds" if phase == "trial" else
+                                          "Tablet mode on" if phase == "locked" else "Restoring input…" if phase == "recovering" else "Input recovery needs attention")
+            self.touch_confirm.set_visible(phase == "trial")
+            self.position_floating()
+        elif self.floating:
+            self.floating.hide()
+
+    def close_panel(self, *_args):
+        if hasattr(self, "trackpad_page") and self.trackpad_page.measuring:
+            self.trackpad_page.cancel()
+        if read_config().get("tablet_automatic") == "true":
+            self.recovery_only = True
+            if not self.held:
+                self.hold()
+                self.held = True
+            self.window.hide()
+            return True
+        self.closing = True
+        if self.tablet:
+            self.tablet.close()
+            self.tablet = None
+        self.quit()
+        return True
+
+    def build_device(self):
+        scroll, page = self.page("Device health", "Live hardware details and a quick route to your Cinnamon settings.")
+        card = box(style="card", spacing=14)
+        for key in ("Computer", "Desktop", "Kernel", "Processor", "Battery", "Display", "Touchscreen", "Sensor", "Agent"):
+            row = box(False, 18)
+            key_label = label(key, "subtle")
+            key_label.set_size_request(95, -1)
+            value = label("Reading…", wrap=True)
+            value.set_selectable(True)
+            self.values[key] = value
+            row.pack_start(key_label, False, False, 0)
+            row.pack_start(value, True, True, 0)
+            card.pack_start(row, False, False, 0)
+        page.pack_start(card, False, False, 0)
+        self.hardware_expander = Gtk.Expander(label="Hardware")
+        hardware_box = box(style="card", spacing=12)
+        self.hardware_expander.add(hardware_box)
+        for group, fields in {
+            "system": ("model", "cpu", "bios", "ec", "kernel"),
+            "thermals": ("cpu", "soc", "charger", "fan", "pwm", "throttle_count", "throttle_delta"),
+            "power": ("charge", "state", "sleep_active", "sleep_available", "sustained_limit", "battery_power", "s0ix_residency"),
+            "input": ("hinge", "mode", "keyboard", "touchpad", "touchscreen", "backlight", "auto_off_timer"),
+            "display": ("name", "refresh_hz", "rotation", "panel_orientation", "calibration", "service"),
+        }.items():
+            hardware_box.pack_start(label(group.title(), "section-title"), False, False, 0)
+            for field in fields:
+                row = box(False, 12)
+                row.pack_start(label(field.replace("_", " ").title(), "subtle"), False, False, 0)
+                widget = label("Unavailable", wrap=True)
+                widget.set_selectable(True)
+                row.pack_end(widget, True, True, 0)
+                hardware_box.pack_start(row, False, False, 0)
+                self.hardware_values[(group, field)] = widget
+        backlight_row = box(False, 8)
+        self.backlight_level = Gtk.SpinButton.new_with_range(0, 1, 1)
+        self.backlight_level.set_sensitive(False)
+        backlight_row.pack_start(label('Keyboard brightness', 'subtle'), False, False, 0)
+        backlight_row.pack_start(self.backlight_level, True, True, 0)
+        self.backlight_apply = Gtk.Button(label='Apply')
+        self.backlight_apply.set_sensitive(False)
+        self.backlight_apply.connect('clicked', lambda *_: self.ec_control('SetBacklight', '(u)', (self.backlight_level.get_value_as_int(),)))
+        backlight_row.pack_end(self.backlight_apply, False, False, 0)
+        hardware_box.pack_start(backlight_row, False, False, 0)
+        self.backlight_timer = Gtk.CheckButton(label='Enable keyboard backlight auto-off')
+        self.backlight_timer.set_sensitive(False)
+        self.backlight_timer.connect('toggled', self.backlight_timer_changed)
+        hardware_box.pack_start(self.backlight_timer, False, False, 0)
+        page.pack_start(self.hardware_expander, False, False, 0)
+        controls = box(False, 8)
+        checks=self.button("Rotation checks", "doctor")
+        checks.set_tooltip_text("Run rotation diagnostics")
+        controls.pack_start(checks, True, True, 0)
+        for title, module in (("Power settings", "power"), ("Display settings", "display")):
+            button = picture_button(Gtk.Button(),title,module,tile=True)
+            button.connect("clicked", lambda _, m=module: subprocess.Popen(settings_command(identify()["desktop"], m)))
+            controls.pack_start(button, True, True, 0)
+        page.pack_start(controls, False, False, 0)
+        page.pack_start(label("Adjust rotation sensitivity on the Display & rotation page.", "subtle", True), False, False, 0)
+        page.pack_start(label("EC controls require a separately approved helper. Display refresh rate, fan PWM and thermal limits are read-only.", "subtle", True), False, False, 0)
+        return scroll
+
+    def backlight_timer_changed(self, button):
+        if not getattr(self, 'hardware_updating', False):
+            self.ec_control('SetBacklightTimer', '(b)', (button.get_active(),))
+
+    def ec_control(self, method, signature, values):
+        def work():
+            from chuwi.ec import Client
+            return Client().call(method, signature, values, timeout=60000)
+        def completed(future):
+            try:
+                future.result()
+                self.message.set_text('Keyboard backlight updated.')
+            except Exception as exc:
+                self.notice.set_text(str(exc)); self.notice.show()
+            self.hardware_at = 0
+            return False
+        self.pool.submit(work).add_done_callback(lambda future: GLib.idle_add(completed, future))
+
+    def build_sensitivity(self):
+        tuning = box(style="card", spacing=12)
+        tuning.pack_start(label("Rotation sensitivity", "section-title"), False, False, 0)
+        tuning.pack_start(label("Higher angles require a more definite turn. The delay filters out brief movements.", "subtle", True), False, False, 0)
+        row = box(False, 10)
+        row.pack_start(label("Required turn", wrap=True), True, True, 0)
+        self.threshold = Gtk.SpinButton.new_with_range(45, 85, 5)
+        self.threshold.get_accessible().set_name("Required turn in degrees")
+        self.threshold.connect("value-changed", self.sensitivity_edited)
+        row.pack_start(self.threshold, False, False, 0)
+        row.pack_start(label("degrees", "subtle"), False, False, 0)
+        tuning.pack_start(row, False, False, 0)
+        row = box(False, 10)
+        row.pack_start(label("Hold steady for", wrap=True), True, True, 0)
+        self.delay = Gtk.SpinButton.new_with_range(.3, 3, .1)
+        self.delay.set_digits(1)
+        self.delay.get_accessible().set_name("Rotation delay in seconds")
+        self.delay.connect("value-changed", self.sensitivity_edited)
+        row.pack_start(self.delay, False, False, 0)
+        row.pack_start(label("seconds", "subtle"), False, False, 0)
+        tuning.pack_start(row, False, False, 0)
+        save = picture_button(Gtk.Button(),"Save","save",accessible="Save rotation sensitivity")
+        save.get_style_context().add_class("suggested-action")
+        save.set_halign(Gtk.Align.END)
+        save.connect("clicked", lambda _: self.run_action("sensitivity", str(self.threshold.get_value()), str(self.delay.get_value())))
+        self.actions.append(save)
+        self.save_sensitivity_button=save
+        tuning.pack_start(save, False, False, 0)
+        return tuning
+
+    def sensitivity_edited(self, _widget):
+        if not self.updating:
+            self.sensitivity_dirty = True
+
+    def build_projects(self):
+        scroll, page = self.page("Built on your earlier work", "Your MiniBook projects, brought together for the MiniBook X.")
+        sources = (
+            ("CHUWI Prime", "The migration handoff and machine testing notes.", "https://github.com/kaoshonen/chuwi_prime"),
+            ("CHUWI Autorotate", "The rotation engine powering this control center.", "https://github.com/kaoshonen/chuwi-autorotate"),
+            ("Brightness & suspend", "Your existing fixes are available for diagnosing future issues.", "https://github.com/kaoshonen/chuwi_brightness_control"),
+            ("MiniBook X on Linux", "Community hardware support notes and kernel status.", "https://github.com/sonnyp/linux-minibook-x"),
+            ("Tablet mode research", "Dual-accelerometer work for a future tablet-mode feature.", "https://github.com/greymouser/minibook-x-tools"),
+        )
+        for title, subtitle, url in sources:
+            card = box(style="card", spacing=6)
+            card.pack_start(label(title, "section-title"), False, False, 0)
+            card.pack_start(label(subtitle, "subtle", True), False, False, 0)
+            link = Gtk.LinkButton.new_with_label(url, "View project ↗")
+            picture_button(link,"Open project","projects",size=(28,26),accessible="Open "+title+" on GitHub")
+            link.set_halign(Gtk.Align.START)
+            card.pack_start(link, False, False, 0)
+            page.pack_start(card, False, False, 0)
+        return scroll
+
+    def toggle(self, name, action, choices, active):
+        if self.updating:
+            return False
+        args = (choices[0] if active else choices[1],)
+        self.run_action(*( (action, *args) if action else args ))
+        return True  # Display the confirmed state after the command succeeds.
+
+    def run_action(self, *args):
+        if self.busy:
+            return
+        if args[0] == "calibrate-home":
+            dialog = Gtk.MessageDialog(transient_for=self.window, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                       buttons=Gtk.ButtonsType.OK_CANCEL, text="Save this as your laptop position?")
+            dialog.format_secondary_text("Keep the laptop in its normal position, with the display upright. This saves the current display orientation and calibrates the sensor.")
+            response = dialog.run()
+            dialog.destroy()
+            if response != Gtk.ResponseType.OK:
+                return
+        self.busy = True
+        for widget in self.actions:
+            widget.set_sensitive(False)
+        self.message.set_text("Applying…")
+        future = self.pool.submit(command, *args)
+        future.add_done_callback(lambda f: GLib.idle_add(self.finish_action, f, args))
+
+    def finish_action(self, future, args):
+        self.busy = False
+        for widget in self.actions:
+            widget.set_sensitive(True)
+        try:
+            result = future.result()
+            output = (result.stdout + result.stderr).strip()
+            if args[0] == "doctor":
+                dialog = Gtk.MessageDialog(transient_for=self.window, modal=True, buttons=Gtk.ButtonsType.CLOSE,
+                                           message_type=Gtk.MessageType.INFO, text="Rotation checks")
+                dialog.format_secondary_text(output)
+                dialog.run()
+                dialog.destroy()
+            if result.returncode:
+                raise RuntimeError(output or "The command failed.")
+            if args[0] == "sensitivity":
+                self.sensitivity_dirty = False
+            self.message.set_text(output.splitlines()[0] if output else "Saved.")
+        except Exception as exc:
+            self.notice.set_text(str(exc))
+            self.notice.show()
+            self.message.set_text("The change could not be completed.")
+        self.refresh()
+        return False
+
+    def refresh(self):
+        if (self.window and self.window.get_visible() and self.hardware_expander.get_mapped() and self.hardware_expander.get_expanded()
+                and not self.hardware_pending and time.monotonic()-self.hardware_at >= 5):
+            self.hardware_pending = True
+            self.hardware_at = time.monotonic()
+            self.pool.submit(self.hardware_snapshot).add_done_callback(lambda f: GLib.idle_add(self.apply_hardware, f))
+        if self.window and self.window.get_visible() and not self.busy and not self.refreshing:
+            self.refreshing = True
+            self.pool.submit(snapshot).add_done_callback(lambda f: GLib.idle_add(self.apply_snapshot, f))
+        return True
+
+    def hardware_snapshot(self):
+        from chuwi.display import parse_verbose
+        from chuwi.hardware import capture
+        from chuwi.session import read
+        displays = parse_verbose(capture(["xrandr", "--verbose"]))
+        selected = next((d for d in displays if d["internal"] and d["active"]), {})
+        runtime = read("controller")
+        runtime.update(calibration="Calibrated" if read_config().get("home_rotation") in ROTATIONS else "Needs calibration",
+                       service=capture(["systemctl", "--user", "is-active", "chuwi-autorotate"]) or "Unavailable")
+        return self.hardware_reader.snapshot(selected, runtime)
+
+    def apply_hardware(self, future):
+        self.hardware_pending = False
+        try:
+            snapshot = future.result()
+            maximum = snapshot['input']['max_brightness']['value']
+            self.hardware_updating = True
+            writable = snapshot['input']['writable']['value'] is True
+            self.backlight_apply.set_sensitive(maximum is not None and writable)
+            self.backlight_level.set_sensitive(maximum is not None and writable)
+            if maximum is not None:
+                self.backlight_level.set_range(0, maximum)
+                if not self.backlight_level.has_focus():
+                    self.backlight_level.set_value(snapshot['input']['backlight']['value'] or 0)
+            timer = snapshot['input']['auto_off_timer']['value']
+            self.backlight_timer.set_sensitive(timer in ('0','1') and writable)
+            self.backlight_timer.set_active(timer == '1')
+            self.hardware_updating = False
+            for (group, field), widget in self.hardware_values.items():
+                reading = snapshot[group][field]
+                text = reading["value"]
+                if isinstance(text, float):
+                    text = f"{text:.1f}"
+                if isinstance(text, list):
+                    text = ", ".join(text)
+                widget.set_text(f"{text} {reading['unit']}".strip() if text is not None else reading["detail"] or "Unavailable")
+                if group == 'thermals' and field == 'fan' and reading['value'] == 0:
+                    widget.set_text('Zero reported — stopped or unreadable')
+                widget.set_tooltip_text(reading["detail"] or reading["source"])
+        except Exception as exc:
+            for widget in self.hardware_values.values():
+                widget.set_text("Unavailable")
+                widget.set_tooltip_text(str(exc))
+        return False
+
+    def apply_snapshot(self, future):
+        self.refreshing = False
+        try:
+            status, config, state = future.result()
+            self.updating = True
+            rotation = status.get("current xrandr rotation", "unknown")
+            running = status.get("systemd user service") == "active"
+            locked = config.get("rotation_locked") == "true"
+            self.rotation_title.set_text(ROTATIONS.get(rotation, "Display unavailable"))
+            sensor = state.get("last_sensor_orientation", "unknown")
+            self.rotation_detail.set_text(f"{status.get('detected display output', 'Unknown display')} · {state.get('posture', 'unknown')} · Sensor: {sensor}")
+            self.badge.set_text("Rotation locked" if locked else "Turn further to rotate" if running and state.get("angle_gate") == "Turn further" else "Following sensor" if running and sensor != "unknown" else "Waiting for sensor" if running else "Auto rotation off")
+            self.preview.rotation = rotation
+            self.preview.queue_draw()
+            self.toggles["auto"].set_active(config.get("enabled") == "true" and running)
+            self.toggles["lock"].set_active(locked)
+            self.toggles["startup"].set_active(status.get("start at sign-in") == "enabled")
+            for target, button in self.rotation_buttons.items():
+                button.set_active(rotation == target)
+            if not self.sensitivity_dirty:
+                self.delay.set_value(float(config.get("debounce_seconds", "1")))
+                self.threshold.set_value(float(config.get("rotation_threshold_degrees", "45")))
+            batteries = list(Path("/sys/class/power_supply").glob("BAT*"))
+            battery = f"{read_text(batteries[0]/'capacity')}% · {read_text(batteries[0]/'status')}" if batteries else "No battery reported"
+            processor = next((line.split(":", 1)[1].strip() for line in read_text('/proc/cpuinfo', '').splitlines() if line.startswith('model name')), "Unavailable")
+            values = {"Computer": read_text('/sys/class/dmi/id/product_name'), "Desktop": os.environ.get('XDG_CURRENT_DESKTOP', 'Unknown') + " · " + os.environ.get('XDG_SESSION_TYPE', 'Unknown'), "Kernel": platform.release(), "Processor": processor, "Battery": battery, "Display": status.get('detected display output', ''), "Touchscreen": status.get('detected touchscreen devices', ''), "Sensor": sensor + " · " + status.get('iio-sensor-proxy status', ''), "Agent": status.get('systemd user service', '')}
+            for key, value in values.items():
+                self.values[key].set_text(value)
+            error = status.get("last error", "") or state.get("angle_sensor_error", "")
+            if error:
+                self.notice.set_text(error)
+                self.notice.show()
+            elif running:
+                self.notice.hide()
+            if self.message.get_text() == "Connecting to rotation service…":
+                self.message.set_text("Ready. Your touchscreen follows the display rotation.")
+        except Exception as exc:
+            self.notice.set_text(str(exc))
+            self.notice.show()
+        finally:
+            self.updating = False
+        return False
+
+    def about(self, _button):
+        dialog = Gtk.AboutDialog(transient_for=self.window, modal=True, program_name="CHUWI Control Center",
+                                 version="0.2", copyright="Made by Kyle Auchterlonie 2026",
+                                 comments="Native MiniBook X controls, powered by chuwi-autorotate.",
+                                 website="https://github.com/kaoshonen/chuwi-autorotate",
+                                 license_type=Gtk.License.AGPL_3_0)
+        dialog.run()
+        dialog.destroy()
+
+    def do_shutdown(self):
+        self.closing = True
+        if hasattr(self, "trackpad_page"):
+            self.trackpad_page.close()
+        if self.tablet:
+            self.tablet.close()
+            self.tablet = None
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        Gtk.Application.do_shutdown(self)
+
+
+if __name__ == "__main__":
+    sys.exit(ControlCenter().run(sys.argv))

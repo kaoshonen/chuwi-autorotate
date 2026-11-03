@@ -1,5 +1,5 @@
 [Unit]
-Description=CHUWI MiniBook auto-rotation for X11/Xfce
+Description=CHUWI MiniBook auto-rotation for X11
 After=graphical-session.target
 PartOf=graphical-session.target
 

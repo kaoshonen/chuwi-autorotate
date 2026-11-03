@@ -10,6 +10,12 @@ elif [[ $# -gt 0 ]]; then
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
+  if systemctl --user cat chuwi-tablet-guard.service >/dev/null 2>&1; then
+    systemctl --user stop chuwi-tablet-guard.service
+  fi
+  if [[ -x "$HOME/.local/bin/chuwi-tablet-guard" ]]; then
+    "$HOME/.local/bin/chuwi-tablet-guard" --restore
+  fi
   systemctl --user disable --now chuwi-autorotate.service || true
 fi
 
@@ -22,6 +28,14 @@ fi
 rm -f "$HOME/.config/systemd/user/chuwi-autorotate.service"
 rm -f "$HOME/.local/bin/chuwi-autorotate"
 rm -f "$HOME/.local/bin/chuwi-autorotate-panel"
+rm -f "$HOME/.local/bin/chuwi-control-panel"
+rm -f "$HOME/.local/bin/chuwi-trackpad"
+rm -f "$HOME/.local/bin/chuwi-tablet-guard"
+rm -rf "$HOME/.local/bin/chuwi"
+rm -f "$HOME/.local/bin/chuwi_tablet.py" "$HOME/.local/bin/chuwi_tablet_client.py"
+rm -f "$HOME/.config/systemd/user/chuwi-tablet-guard.service"
+rm -f "$HOME/.config/autostart/chuwi-autorotate.desktop"
+rm -f "$HOME/.local/share/applications/chuwi-control-panel.desktop"
 rm -f "$HOME/.local/share/applications/chuwi-autorotate-panel.desktop"
 rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/chuwi-autorotate-panel.svg"
 
@@ -45,3 +59,5 @@ else
   echo "Uninstalled chuwi-autorotate. Config preserved at ~/.config/chuwi-autorotate."
   echo "Run ./uninstall.sh --purge to remove config and logs too."
 fi
+
+printf "%s\n" "Trackpad system filtering and root backups were preserved. Use chuwi-trackpad restore before uninstalling to undo a saved filter."

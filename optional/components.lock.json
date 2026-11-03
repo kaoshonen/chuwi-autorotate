@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/fstanis/chuwi-minibook",
+  "revision": "e37d4f821ba2eda1279e79a15d517590697b7e39",
+  "archive_url": "https://codeload.github.com/fstanis/chuwi-minibook/tar.gz/e37d4f821ba2eda1279e79a15d517590697b7e39",
+  "sha256": "f68578898cdb9ef737dffc57dc0a89065060c839efb9491b6e15dd973ac3e6c0",
+  "components": {
+    "ec": {"path": "modules/minibook_ec", "license": "GPL-2.0-or-later", "patch": "patches/0001-ec-safety.patch", "status": "Requires attention"},
+    "proxy": {"path": "iio-sensor-proxy", "license": "GPL-3.0", "patch": "patches/0002-sensor-extension.patch", "status": "Requires attention"},
+    "goodix": {"status": "Unsupported", "reason": "No reproduced fault or exact distro source comparison; configuration blob provenance unresolved"},
+    "i2c_designware_spklen": {"status": "Unsupported", "reason": "Concurrency, controller selection and register restoration unresolved"},
+    "dptf_enabler": {"status": "Unsupported", "reason": "Firmware-memory mutation is not undone on unload"},
+    "thermald": {"status": "Optional", "reason": "Keep stock thermald; measurement-only assessment"}
+  }
+}
